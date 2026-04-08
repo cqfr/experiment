@@ -9,21 +9,22 @@ from typing import Dict, Optional, Tuple
 import torch
 
 
-def _rdp_subsampled_gaussian(q: float, sigma: float, alpha: float) -> float:
+def _rdp_subsampled_gaussian(q: float, noise_multiplier: float, alpha: float) -> float:
     """Approximate one-step RDP for Poisson-subsampled Gaussian mechanism.
 
     This uses the common small-q upper bound:
-        RDP(alpha) ~= alpha * q^2 / (2 * sigma^2)
-    It is monotonic in sigma and sufficient for stable round-wise calibration.
+        RDP(alpha) ~= alpha * q^2 / (2 * noise_multiplier^2)
+    It is monotonic in noise multiplier z and sufficient for stable round-wise
+    calibration.
     """
 
-    if sigma <= 0:
-        raise ValueError("sigma must be > 0")
+    if noise_multiplier <= 0:
+        raise ValueError("noise_multiplier must be > 0")
     if not (0 < q <= 1):
         raise ValueError("q must be in (0, 1]")
     if alpha <= 1:
         raise ValueError("alpha must be > 1")
-    return (alpha * (q**2)) / (2.0 * (sigma**2))
+    return (alpha * (q**2)) / (2.0 * (noise_multiplier**2))
 
 
 def _epsilon_from_rdp(rdp_values: Dict[float, float], delta: float) -> float:
@@ -42,7 +43,7 @@ def _epsilon_from_rdp(rdp_values: Dict[float, float], delta: float) -> float:
 
 @dataclass
 class RDPAccountant:
-    """Round-wise RDP accountant with sigma calibration for each round target."""
+    """Round-wise RDP accountant with noise-multiplier calibration."""
 
     epsilon_total: float
     delta: float
@@ -76,17 +77,17 @@ class RDPAccountant:
 
         return self.current_epsilon() >= self.epsilon_total
 
-    def solve_sigma_for_round(
+    def solve_noise_multiplier_for_round(
         self,
         q: float,
         steps: int = 1,
         epsilon_target: Optional[float] = None,
-        sigma_lo: float = 1e-3,
-        sigma_hi: float = 1e3,
+        z_lo: float = 1e-3,
+        z_hi: float = 1e3,
         tol: float = 1e-6,
-        max_iter: int = 80,
+        max_iter: int = 200,
     ) -> float:
-        """Binary-search sigma that satisfies one-round epsilon target."""
+        """Binary-search noise multiplier z for one-round epsilon target."""
 
         if steps <= 0:
             raise ValueError("steps must be > 0")
@@ -94,36 +95,57 @@ class RDPAccountant:
         if target <= 0:
             raise ValueError("epsilon target must be > 0")
 
-        def round_eps(sigma: float) -> float:
+        def round_eps(z: float) -> float:
             one_round_rdp = {
-                alpha: steps * _rdp_subsampled_gaussian(q=q, sigma=sigma, alpha=alpha)
+                alpha: steps
+                * _rdp_subsampled_gaussian(
+                    q=q,
+                    noise_multiplier=z,
+                    alpha=alpha,
+                )
                 for alpha in self.orders
             }
             return _epsilon_from_rdp(one_round_rdp, self.delta)
 
         # Ensure upper bound is feasible.
-        while round_eps(sigma_hi) > target and sigma_hi < 1e7:
-            sigma_hi *= 2.0
+        while round_eps(z_hi) > target and z_hi < 1e7:
+            z_hi *= 2.0
 
         for _ in range(max_iter):
-            mid = 0.5 * (sigma_lo + sigma_hi)
+            mid = 0.5 * (z_lo + z_hi)
             eps_mid = round_eps(mid)
             if abs(eps_mid - target) <= tol:
                 return mid
             if eps_mid > target:
-                sigma_lo = mid
+                z_lo = mid
             else:
-                sigma_hi = mid
+                z_hi = mid
 
-        return sigma_hi
+        return z_hi
 
-    def consume_round(self, sigma: float, q: float, steps: int = 1) -> float:
+    def solve_sigma_for_round(self, *args, **kwargs) -> float:
+        """Backward-compatible alias; returns noise multiplier z."""
+        return self.solve_noise_multiplier_for_round(*args, **kwargs)
+
+    def consume_round(
+        self,
+        noise_multiplier: Optional[float] = None,
+        q: float = 1.0,
+        steps: int = 1,
+        sigma: Optional[float] = None,
+    ) -> float:
         """Accumulate one round and return new composed epsilon."""
+
+        z = noise_multiplier
+        if z is None:
+            z = sigma
+        if z is None:
+            raise ValueError("noise_multiplier (or legacy sigma) must be provided")
 
         for alpha in self.orders:
             self._rdp_cumulative[alpha] += steps * _rdp_subsampled_gaussian(
                 q=q,
-                sigma=sigma,
+                noise_multiplier=z,
                 alpha=alpha,
             )
         self.round_count += 1
@@ -243,6 +265,6 @@ if __name__ == "__main__":
         num_rounds=100,
         orders=(2, 4, 8, 16, 32, 64, 128),
     )
-    sigma = accountant.solve_sigma_for_round(q=0.1, steps=1)
-    eps = accountant.consume_round(sigma=sigma, q=0.1, steps=1)
-    print(f"sigma={sigma:.6f}, eps={eps:.6f}")
+    z = accountant.solve_noise_multiplier_for_round(q=0.1, steps=1)
+    eps = accountant.consume_round(noise_multiplier=z, q=0.1, steps=1)
+    print(f"noise_multiplier={z:.6f}, eps={eps:.6f}")

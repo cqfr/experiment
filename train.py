@@ -78,6 +78,7 @@ class FLTrainer:
             "clip_history": [],
             "privacy_spent": [],
             "upload_ratio": [],
+            "noise_multiplier": [],
             "sigma_base": [],
         }
 
@@ -98,13 +99,16 @@ class FLTrainer:
     def train_round(self, round_num: int) -> Dict[str, float]:
         clip_norm = self.server.get_clip_norm()
         sampling_rate = self.config.clients_per_round / self.config.num_clients
+        effective_rate = sampling_rate * self.config.client.topk_ratio
 
         if self.privacy_accountant is not None:
-            sigma_base = self.privacy_accountant.solve_sigma_for_round(
-                q=sampling_rate,
+            noise_multiplier = self.privacy_accountant.solve_noise_multiplier_for_round(
+                q=effective_rate,
                 steps=self.config.dp.rdp_steps_per_round,
             )
+            sigma_base = noise_multiplier * clip_norm
         else:
+            noise_multiplier = 0.0
             sigma_base = 0.0
 
         selected_ids = self._select_clients(self.config.clients_per_round)
@@ -161,6 +165,7 @@ class FLTrainer:
         train_metrics["avg_upload_ratio"] = (
             float(np.mean(upload_ratios)) if upload_ratios else 1.0
         )
+        train_metrics["noise_multiplier"] = float(noise_multiplier)
         train_metrics["sigma_base"] = float(sigma_base)
         if viz_importance is not None and viz_client_id is not None:
             self._save_importance_visualization(
@@ -172,8 +177,8 @@ class FLTrainer:
 
         if self.privacy_accountant is not None:
             eps_spent = self.privacy_accountant.consume_round(
-                sigma=sigma_base,
-                q=sampling_rate,
+                noise_multiplier=noise_multiplier,
+                q=effective_rate,
                 steps=self.config.dp.rdp_steps_per_round,
             )
             train_metrics["epsilon_spent"] = float(eps_spent)
@@ -273,6 +278,7 @@ class FLTrainer:
             self.history["test_metrics"].append(test_metrics)
             self.history["clip_history"].append(train_metrics.get("new_clip", 0.0))
             self.history["upload_ratio"].append(train_metrics.get("avg_upload_ratio", 1.0))
+            self.history["noise_multiplier"].append(train_metrics.get("noise_multiplier", 0.0))
             self.history["sigma_base"].append(train_metrics.get("sigma_base", 0.0))
 
             if self.privacy_accountant is not None:
@@ -289,6 +295,7 @@ class FLTrainer:
                 if self.privacy_accountant is not None:
                     msg += (
                         f" | eps={train_metrics.get('epsilon_spent', 0.0):.4f}"
+                        f" | z={train_metrics.get('noise_multiplier', 0.0):.4f}"
                         f" | sigma={train_metrics.get('sigma_base', 0.0):.4f}"
                     )
                 tqdm.write(msg)
@@ -349,6 +356,7 @@ class FLTrainer:
             "privacy_spent": self.history["privacy_spent"],
             "noise_sigma": [m.get("avg_noise_sigma", 0.0) for m in self.history["train_metrics"]],
             "upload_ratio": self.history["upload_ratio"],
+            "noise_multiplier": self.history["noise_multiplier"],
             "sigma_base": self.history["sigma_base"],
         }
 
