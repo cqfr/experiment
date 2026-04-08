@@ -1,320 +1,142 @@
-"""
-run_ablation.py
-消融实验脚本
+﻿from __future__ import annotations
 
-实验组：
-1. FedAvg（基线，无DP）
-2. DP-FedAvg（基线，有DP）
-3. 完整方法（三模块全开）
-4. 去掉梯度压缩
-5. 去掉自适应裁剪
-6. 去掉异构噪声
-7. 去掉Contrastive Loss
-"""
+"""Ablation and baseline runner."""
 
-import os
+import argparse
 import json
-import copy
+import os
 from datetime import datetime
 from typing import Dict, List
 
+from config import ClipUpdateMethod, TrainingStrategy
+from train import FLTrainer
 from config import (
     ExperimentConfig,
-    ClientConfig,
-    ServerConfig,
-    DPConfig,
-    TrainingStrategy,
-    ImportanceStrategy,
-    TopKStrategy,
-    ClipUpdateMethod,
+    get_dp_fedavg_config,
+    get_dp_fedsam_config,
+    get_fedavg_config,
+    get_proposed_config,
 )
-from train import FLTrainer
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 实验配置定义
-# ══════════════════════════════════════════════════════════════════════════════
-
-def get_base_config() -> ExperimentConfig:
-    """基础配置（所有实验共享）"""
-    config = ExperimentConfig()
-    
-    # 基础设置
-    config.seed = 42
+def _base_overrides(config: ExperimentConfig, num_rounds: int, dataset: str) -> ExperimentConfig:
+    config.num_rounds = num_rounds
+    config.dataset = dataset
     config.num_clients = 100
     config.clients_per_round = 10
-    config.num_rounds = 100
-    config.batch_size = 32
-    
-    # 数据集
-    config.dataset = "cifar10"
     config.iid = False
-    config.alpha = 0.5  # Non-IID
-    
-    # 日志
-    config.log_interval = 5
-    config.save_interval = 20
-    
+    config.alpha = 0.5
     return config
 
 
-def get_fedavg_config() -> ExperimentConfig:
-    """实验1: FedAvg（无DP基线）"""
-    config = get_base_config()
-    
-    # 无DP
-    config.dp.enabled = False
-    
-    # 标准训练
-    config.client.training_strategy = TrainingStrategy.STANDARD
-    config.client.topk_ratio = 1.0  # 不压缩
-    config.client.use_residual = False
-    
-    return config
+def get_ablation_set(epsilon: float, num_rounds: int, dataset: str) -> Dict[str, ExperimentConfig]:
+    exps: Dict[str, ExperimentConfig] = {}
+
+    exps["fedavg"] = _base_overrides(get_fedavg_config(), num_rounds, dataset)
+    exps["dp_fedavg"] = _base_overrides(get_dp_fedavg_config(epsilon), num_rounds, dataset)
+    exps["dp_fedsam"] = _base_overrides(get_dp_fedsam_config(epsilon), num_rounds, dataset)
+    exps["proposed_full"] = _base_overrides(get_proposed_config(epsilon), num_rounds, dataset)
+
+    no_compression = _base_overrides(get_proposed_config(epsilon), num_rounds, dataset)
+    no_compression.client.topk_ratio = 1.0
+    no_compression.client.use_residual = False
+    exps["ablation_no_compression"] = no_compression
+
+    no_adaptive_clip = _base_overrides(get_proposed_config(epsilon), num_rounds, dataset)
+    no_adaptive_clip.server.clip_update_method = ClipUpdateMethod.EMA
+    no_adaptive_clip.server.ema_alpha = 1.0
+    exps["ablation_no_adaptive_clip"] = no_adaptive_clip
+
+    no_hetero_noise = _base_overrides(get_proposed_config(epsilon), num_rounds, dataset)
+    no_hetero_noise.dp.use_heterogeneous_noise = False
+    exps["ablation_no_hetero_noise"] = no_hetero_noise
+
+    no_contrastive = _base_overrides(get_proposed_config(epsilon), num_rounds, dataset)
+    no_contrastive.client.training_strategy = TrainingStrategy.STANDARD
+    exps["ablation_no_contrastive"] = no_contrastive
+
+    return exps
 
 
-def get_dp_fedavg_config(epsilon: float = 8.0) -> ExperimentConfig:
-    """实验2: DP-FedAvg（有DP基线）"""
-    config = get_base_config()
-    
-    # DP配置
-    config.dp.enabled = True
-    config.dp.epsilon_total = epsilon
-    config.dp.use_heterogeneous_noise = False  # 同构噪声
-    
-    # 标准训练
-    config.client.training_strategy = TrainingStrategy.STANDARD
-    config.client.topk_ratio = 1.0  # 不压缩
-    config.client.use_residual = False
-    
-    # 固定裁剪阈值
-    config.server.clip_update_method = ClipUpdateMethod.EMA
-    
-    return config
+def run_one(name: str, config: ExperimentConfig) -> Dict:
+    print("=" * 72)
+    print(f"Running: {name}")
+    print("=" * 72)
 
-
-def get_proposed_full_config(epsilon: float = 8.0) -> ExperimentConfig:
-    """实验3: 完整方法（三模块全开）"""
-    config = get_base_config()
-    
-    # DP配置
-    config.dp.enabled = True
-    config.dp.epsilon_total = epsilon
-    config.dp.use_heterogeneous_noise = True
-    config.dp.use_subsampling_amplification = True
-    config.dp.use_sparsity_amplification = True
-    
-    # Contrastive Loss
-    config.client.training_strategy = TrainingStrategy.CONTRASTIVE
-    config.client.alpha = 0.005
-    config.client.beta = 0.005
-    
-    # 梯度压缩
-    config.client.topk_ratio = 0.1
-    config.client.topk_strategy = TopKStrategy.WEIGHTED_LAYER_NORM
-    config.client.importance_strategy = ImportanceStrategy.GRAD_NORMALIZED
-    config.client.use_residual = True
-    
-    # 自适应裁剪
-    config.server.clip_update_method = ClipUpdateMethod.ADAPTIVE
-    config.server.target_quantile = 0.5
-    config.server.clip_lr = 0.2
-    
-    return config
-
-
-def get_ablation_no_compression(epsilon: float = 8.0) -> ExperimentConfig:
-    """实验4: 去掉梯度压缩"""
-    config = get_proposed_full_config(epsilon)
-    
-    # 禁用压缩
-    config.client.topk_ratio = 1.0  # 不压缩
-    config.client.use_residual = False
-    config.dp.use_sparsity_amplification = False
-    
-    return config
-
-
-def get_ablation_no_adaptive_clip(epsilon: float = 8.0) -> ExperimentConfig:
-    """实验5: 去掉自适应裁剪"""
-    config = get_proposed_full_config(epsilon)
-    
-    # 使用固定裁剪阈值
-    config.server.clip_update_method = ClipUpdateMethod.EMA
-    config.server.ema_alpha = 1.0  # 相当于固定阈值
-    
-    return config
-
-
-def get_ablation_no_hetero_noise(epsilon: float = 8.0) -> ExperimentConfig:
-    """实验6: 去掉异构噪声"""
-    config = get_proposed_full_config(epsilon)
-    
-    # 使用同构噪声
-    config.dp.use_heterogeneous_noise = False
-    
-    return config
-
-
-def get_ablation_no_contrastive(epsilon: float = 8.0) -> ExperimentConfig:
-    """实验7: 去掉Contrastive Loss"""
-    config = get_proposed_full_config(epsilon)
-    
-    # 标准训练
-    config.client.training_strategy = TrainingStrategy.STANDARD
-    
-    return config
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 实验运行
-# ══════════════════════════════════════════════════════════════════════════════
-
-EXPERIMENTS = {
-    "fedavg": ("FedAvg (无DP)", get_fedavg_config),
-    "dp_fedavg": ("DP-FedAvg", get_dp_fedavg_config),
-    "proposed_full": ("完整方法", get_proposed_full_config),
-    "ablation_no_compress": ("消融: 无梯度压缩", get_ablation_no_compression),
-    "ablation_no_adaptive": ("消融: 无自适应裁剪", get_ablation_no_adaptive_clip),
-    "ablation_no_hetero": ("消融: 无异构噪声", get_ablation_no_hetero_noise),
-    "ablation_no_contrastive": ("消融: 无Contrastive Loss", get_ablation_no_contrastive),
-}
-
-
-def run_single_experiment(
-    exp_name: str,
-    config: ExperimentConfig,
-    exp_label: str,
-) -> Dict:
-    """运行单个实验"""
-    print(f"\n{'='*60}")
-    print(f"实验: {exp_label}")
-    print(f"名称: {exp_name}")
-    print(f"{'='*60}")
-    
-    # 设置保存路径
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    config.save_dir = f"./results/{exp_name}_{timestamp}"
-    config.log_dir = f"./results/{exp_name}_{timestamp}/logs"
-    
-    # 创建训练器并训练
+    config.save_dir = f"./results/{name}_{timestamp}"
+    config.log_dir = f"./results/{name}_{timestamp}/logs"
+
     trainer = FLTrainer(config)
-    results = trainer.train()
-    
-    # 添加实验信息
-    results["experiment"] = exp_name
-    results["label"] = exp_label
-    results["config"] = {
-        "dp_enabled": config.dp.enabled,
-        "epsilon": config.dp.epsilon_total if config.dp.enabled else None,
+    result = trainer.train()
+    result["experiment"] = name
+    result["config"] = {
+        "dataset": config.dataset,
+        "strategy": config.client.training_strategy.value,
         "topk_ratio": config.client.topk_ratio,
-        "training_strategy": config.client.training_strategy.value,
-        "clip_method": config.server.clip_update_method.value,
-        "hetero_noise": config.dp.use_heterogeneous_noise,
+        "clip_update": config.server.clip_update_method.value,
+        "heterogeneous_noise": config.dp.use_heterogeneous_noise,
+        "epsilon_total": config.dp.epsilon_total if config.dp.enabled else None,
     }
-    
-    return results
+    return result
 
 
 def run_ablation_study(
-    epsilon: float = 8.0,
-    experiments: List[str] = None,
-    num_rounds: int = 100,
+    epsilon: float,
+    num_rounds: int,
+    dataset: str,
+    experiments: List[str] | None,
 ) -> Dict[str, Dict]:
-    """
-    运行消融实验
-    
-    参数:
-        epsilon: 隐私预算
-        experiments: 要运行的实验列表（默认全部）
-        num_rounds: 训练轮数
-    """
+    all_configs = get_ablation_set(epsilon=epsilon, num_rounds=num_rounds, dataset=dataset)
+
     if experiments is None:
-        experiments = list(EXPERIMENTS.keys())
-    
-    all_results = {}
-    
-    for exp_name in experiments:
-        if exp_name not in EXPERIMENTS:
-            print(f"警告: 未知实验 {exp_name}")
+        selected = list(all_configs.keys())
+    else:
+        selected = experiments
+
+    results: Dict[str, Dict] = {}
+    for name in selected:
+        if name not in all_configs:
+            print(f"Skip unknown experiment: {name}")
             continue
-        
-        exp_label, config_fn = EXPERIMENTS[exp_name]
-        
-        # 获取配置
-        if "fedavg" in exp_name and "dp" not in exp_name:
-            config = config_fn()
-        else:
-            config = config_fn(epsilon)
-        
-        # 更新轮数
-        config.num_rounds = num_rounds
-        
-        # 运行实验
-        results = run_single_experiment(exp_name, config, exp_label)
-        all_results[exp_name] = results
-    
-    # 保存汇总结果
-    summary_path = f"./results/ablation_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        results[name] = run_one(name, all_configs[name])
+
     os.makedirs("./results", exist_ok=True)
-    
-    summary = {
-        "experiments": list(all_results.keys()),
-        "epsilon": epsilon,
-        "num_rounds": num_rounds,
-        "results": {
-            name: {
-                "best_accuracy": r["best_accuracy"],
-                "final_accuracy": r["final_accuracy"],
-                "config": r["config"],
-            }
-            for name, r in all_results.items()
-        }
-    }
-    
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
-    
-    print(f"\n{'='*60}")
-    print("消融实验完成")
-    print(f"{'='*60}")
-    print(f"\n结果汇总:")
-    print(f"{'实验':<30} {'最佳准确率':>12} {'最终准确率':>12}")
+    summary_path = f"./results/ablation_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+
+    print("\nSummary")
+    print(f"{'Experiment':<28} {'Best Acc':>12} {'Final Acc':>12}")
     print("-" * 56)
-    for name, r in all_results.items():
-        label = EXPERIMENTS[name][0]
-        print(f"{label:<30} {r['best_accuracy']:>12.2%} {r['final_accuracy']:>12.2%}")
-    print(f"\n汇总已保存到: {summary_path}")
-    
-    return all_results
+    for name, r in results.items():
+        print(f"{name:<28} {r['best_accuracy']:>12.2%} {r['final_accuracy']:>12.2%}")
+    print(f"Saved summary to: {summary_path}")
+
+    return results
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 主函数
-# ══════════════════════════════════════════════════════════════════════════════
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run baseline/ablation experiments")
+    parser.add_argument("--experiments", nargs="+", default=None)
+    parser.add_argument("--epsilon", type=float, default=8.0)
+    parser.add_argument("--num_rounds", type=int, default=100)
+    parser.add_argument("--dataset", choices=["cifar10", "mnist"], default="cifar10")
+    parser.add_argument("--quick_test", action="store_true")
+    return parser.parse_args()
 
-if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="消融实验")
-    parser.add_argument("--experiments", type=str, nargs="+", default=None,
-                        choices=list(EXPERIMENTS.keys()),
-                        help="要运行的实验（默认全部）")
-    parser.add_argument("--epsilon", type=float, default=8.0,
-                        help="隐私预算 ε")
-    parser.add_argument("--num_rounds", type=int, default=100,
-                        help="训练轮数")
-    parser.add_argument("--quick_test", action="store_true",
-                        help="快速测试模式（少量轮次）")
-    
-    args = parser.parse_args()
-    
+
+def main() -> None:
+    args = parse_args()
     if args.quick_test:
         args.num_rounds = 5
-        print("快速测试模式: 5轮")
-    
     run_ablation_study(
         epsilon=args.epsilon,
-        experiments=args.experiments,
         num_rounds=args.num_rounds,
+        dataset=args.dataset,
+        experiments=args.experiments,
     )
+
+
+if __name__ == "__main__":
+    main()

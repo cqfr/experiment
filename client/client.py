@@ -1,56 +1,45 @@
-"""
-client/client.py
-联邦学习客户端
-实现：本地训练、梯度压缩、裁剪、加噪、上传
-"""
+﻿from __future__ import annotations
+
+"""Federated client implementation."""
 
 import copy
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from typing import Dict, Tuple, Optional, Any
-from dataclasses import dataclass
 
-import sys
-sys.path.append('..')
-
-from config import ClientConfig, DPConfig, TrainingStrategy, ImportanceStrategy, TopKStrategy
+from config import ClientConfig, DPConfig, ImportanceStrategy, TrainingStrategy
 from compression.topk import (
-    compress_gradient, ResidualAccumulator,
-    compute_fisher_information, compute_importance_grad_normalized
+    ResidualAccumulator,
+    compute_fisher_information,
+    compute_importance_grad_normalized,
+    compress_gradient,
 )
 from dp.noise import (
-    compute_base_noise_std, add_noise_to_gradient,
-    allocate_heterogeneous_epsilon, compute_heterogeneous_noise_std,
-    add_heterogeneous_noise
+    add_heterogeneous_noise,
+    add_noise_to_tensor,
+    allocate_relative_scales,
 )
 
 
 @dataclass
 class ClientUpdate:
-    """客户端上传的内容"""
-    gradient: Dict[str, torch.Tensor]    # 加噪后的梯度更新
-    data_size: int                        # 本地数据集大小
-    stat: float                           # L2范数统计（用于自适应裁剪）
-    clipped: bool                         # 是否被裁剪
-    noise_sigma: float = 0.0              # 添加的噪声强度（用于日志）
+    """Payload uploaded by a client."""
+
+    delta_w: Dict[str, torch.Tensor]
+    data_size: int
+    stat: float
+    clipped: bool
+    noise_sigma: float = 0.0
+    upload_ratio: float = 1.0
 
 
 class FLClient:
-    """
-    联邦学习客户端
-    
-    职责：
-    1. 接收全局模型
-    2. 本地训练（可选 Contrastive Loss）
-    3. 残差累积
-    4. 重要性评估 + Top-k 压缩
-    5. 梯度裁剪
-    6. 差分隐私加噪
-    7. 上传更新
-    """
-    
+    """Client worker for local training, compression, clipping, and DP noise."""
+
     def __init__(
         self,
         client_id: int,
@@ -59,47 +48,31 @@ class FLClient:
         config: ClientConfig,
         dp_config: DPConfig,
         device: torch.device,
-    ):
+    ) -> None:
         self.client_id = client_id
         self.model = copy.deepcopy(model).to(device)
         self.dataloader = dataloader
         self.config = config
         self.dp_config = dp_config
         self.device = device
-        
-        # 本地数据集大小
+
         self.data_size = len(dataloader.dataset)
-        
-        # 残差累积器
         self.residual_accumulator = ResidualAccumulator()
-        
-        # 保存上一轮的本地模型（用于 Contrastive Loss）
+
         self.old_local_weights: Optional[Dict[str, torch.Tensor]] = None
-        
-        # Fisher 信息缓存（用于 fisher_grad 策略）
+        self.global_weights: Optional[Dict[str, torch.Tensor]] = None
         self.fisher_cache: Optional[Dict[str, torch.Tensor]] = None
-        
-        # 随机数生成器（保证可复现）
-        # 注意：Generator 在 CPU 上更兼容，噪声生成后再移动到目标设备
-        self.rng = torch.Generator(device='cpu')
-    
-    def receive_global_model(self, global_weights: Dict[str, torch.Tensor]):
-        """Step 1: 接收全局模型"""
+
+        self.rng = torch.Generator(device="cpu")
+
+    def receive_global_model(self, global_weights: Dict[str, torch.Tensor]) -> None:
         self.model.load_state_dict(global_weights)
-        # 保存全局模型作为参考
         self.global_weights = {k: v.clone() for k, v in global_weights.items()}
-    
+
     def local_train(self) -> Dict[str, torch.Tensor]:
-        """
-        Step 2: 本地训练
-        
-        根据配置选择训练策略：
-        - STANDARD: 只用交叉熵
-        - CONTRASTIVE: L_CE + α||w-w_g||² - β||w-w_old||²
-        - FEDPROX: L_CE + μ||w-w_g||²
-        """
+        """Run local optimization and return model delta: Delta_w = w_local - w_global."""
+
         self.model.train()
-        
         optimizer = optim.SGD(
             self.model.parameters(),
             lr=self.config.lr,
@@ -107,430 +80,287 @@ class FLClient:
             weight_decay=self.config.weight_decay,
         )
         criterion = nn.CrossEntropyLoss()
-        
-        # 保存训练前的模型参数
+
         init_weights = {k: v.clone() for k, v in self.model.state_dict().items()}
-        
-        for epoch in range(self.config.local_epochs):
-            for data, target in self.dataloader:
-                data, target = data.to(self.device), target.to(self.device)
-                
-                optimizer.zero_grad()
-                output = self.model(data)
-                
-                # 基础交叉熵损失
-                loss = criterion(output, target)
-                
-                # 添加正则项
-                if self.config.training_strategy == TrainingStrategy.CONTRASTIVE:
-                    loss += self._contrastive_regularization()
-                elif self.config.training_strategy == TrainingStrategy.FEDPROX:
-                    loss += self._fedprox_regularization()
-                
-                loss.backward()
-                optimizer.step()
-        
-        # 计算模型更新（梯度 = 新参数 - 旧参数）
-        gradient = {}
+
+        if self.config.training_strategy == TrainingStrategy.DP_FEDSAM:
+            self._train_dp_fedsam(optimizer, criterion)
+        else:
+            self._train_standard(optimizer, criterion)
+
+        delta_w: Dict[str, torch.Tensor] = {}
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                gradient[name] = param.data - init_weights[name]
-        
-        # 更新 old_local_weights（用于下一轮的 Contrastive Loss）
+                delta_w[name] = param.data - init_weights[name]
+
         self.old_local_weights = {k: v.clone() for k, v in self.model.state_dict().items()}
-        
-        return gradient
-    
-    def _contrastive_regularization(self) -> torch.Tensor:
-        """
-        Contrastive Loss 正则项
-        
-        L_contrastive = α||w - w_g||² - β||w - w_old||²
-        
-        α 项：拉向全局模型，减少 drift
-        β 项：推离上一轮本地模型，保持多样性
-        """
+        return delta_w
+
+    def _train_standard(self, optimizer: optim.Optimizer, criterion: nn.Module) -> None:
+        for _ in range(self.config.local_epochs):
+            for data, target in self.dataloader:
+                data, target = data.to(self.device), target.to(self.device)
+                optimizer.zero_grad()
+                logits = self.model(data)
+                loss = criterion(logits, target)
+
+                if self.config.training_strategy in {
+                    TrainingStrategy.CONTRASTIVE,
+                    TrainingStrategy.FEDPROX,
+                }:
+                    loss = loss + self._regularization_loss()
+
+                loss.backward()
+                optimizer.step()
+
+    def _train_dp_fedsam(self, optimizer: optim.Optimizer, criterion: nn.Module) -> None:
+        """Local DP-FedSAM baseline (SAM-style two-step update)."""
+
+        for _ in range(self.config.local_epochs):
+            for data, target in self.dataloader:
+                data, target = data.to(self.device), target.to(self.device)
+
+                # First step: gradient at current weights.
+                optimizer.zero_grad()
+                loss = criterion(self.model(data), target)
+                loss.backward()
+
+                grad_norm = self._grad_l2_norm()
+                scale = self.config.sam_rho / (grad_norm + self.config.sam_eps)
+
+                perturbations = []
+                with torch.no_grad():
+                    for param in self.model.parameters():
+                        if param.grad is None:
+                            perturbations.append(None)
+                            continue
+                        e_w = param.grad * scale
+                        param.add_(e_w)
+                        perturbations.append(e_w)
+
+                # Second step: gradient at perturbed weights.
+                optimizer.zero_grad()
+                loss_perturbed = criterion(self.model(data), target)
+                loss_perturbed.backward()
+
+                with torch.no_grad():
+                    for param, e_w in zip(self.model.parameters(), perturbations):
+                        if e_w is not None:
+                            param.sub_(e_w)
+
+                optimizer.step()
+
+    def _grad_l2_norm(self) -> torch.Tensor:
+        norms = []
+        for param in self.model.parameters():
+            if param.grad is not None:
+                norms.append(torch.norm(param.grad, p=2))
+        if not norms:
+            return torch.tensor(0.0, device=self.device)
+        return torch.norm(torch.stack(norms), p=2)
+
+    def _regularization_loss(self) -> torch.Tensor:
+        if self.global_weights is None:
+            return torch.tensor(0.0, device=self.device)
+
         reg = torch.tensor(0.0, device=self.device)
-        
+
+        if self.config.training_strategy == TrainingStrategy.FEDPROX:
+            for name, param in self.model.named_parameters():
+                if param.requires_grad and name in self.global_weights:
+                    diff = param - self.global_weights[name]
+                    reg = reg + self.config.mu * diff.pow(2).sum()
+            return reg
+
+        # Bounded contrastive term:
+        # alpha*||w-wg||^2 + beta*max(0, margin-||w-w_old||)^2
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
-            
-            # α||w - w_g||²: 全局一致性
+
             if name in self.global_weights:
                 diff_global = param - self.global_weights[name]
-                reg += self.config.alpha * diff_global.pow(2).sum()
-            
-            # -β||w - w_old||²: 局部多样性
+                reg = reg + self.config.alpha * diff_global.pow(2).sum()
+
             if self.old_local_weights is not None and name in self.old_local_weights:
                 diff_old = param - self.old_local_weights[name]
-                reg -= self.config.beta * diff_old.pow(2).sum()
-        
+                distance = torch.norm(diff_old, p=2)
+                hinge = torch.relu(self.config.contrastive_margin - distance)
+                reg = reg + self.config.beta * hinge.pow(2)
+
         return reg
-    
-    def _fedprox_regularization(self) -> torch.Tensor:
-        """
-        FedProx 正则项
-        
-        L_prox = μ||w - w_g||²
-        """
-        reg = torch.tensor(0.0, device=self.device)
-        
-        for name, param in self.model.named_parameters():
-            if not param.requires_grad:
-                continue
-            if name in self.global_weights:
-                diff = param - self.global_weights[name]
-                reg += self.config.mu * diff.pow(2).sum()
-        
-        return reg
-    
-    def accumulate_residual(
-        self,
-        gradient: Dict[str, torch.Tensor],
-    ) -> Dict[str, torch.Tensor]:
-        """Step 3: 残差累积"""
+
+    def accumulate_residual(self, delta_w: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         if self.config.use_residual:
-            return self.residual_accumulator.accumulate(gradient)
-        return gradient
-    
-    def compute_importance(
-        self,
-        gradient: Dict[str, torch.Tensor],
-    ) -> Dict[str, torch.Tensor]:
-        """Step 4: 参数重要性评估"""
+            return self.residual_accumulator.accumulate(delta_w)
+        return delta_w
+
+    def compute_importance(self, delta_w: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         strategy = self.config.importance_strategy
-        
+
         if strategy == ImportanceStrategy.FISHER_GRAD:
-            # 计算或使用缓存的 Fisher 信息
             if self.fisher_cache is None:
                 self.fisher_cache = compute_fisher_information(
-                    self.model, self.dataloader, self.device
+                    self.model,
+                    self.dataloader,
+                    self.device,
                 )
-            # Fisher × |梯度|
-            importance = {}
-            for name, grad in gradient.items():
-                if name in self.fisher_cache:
-                    importance[name] = self.fisher_cache[name] * grad.abs()
-                else:
-                    importance[name] = grad.abs()
-            return importance
-        
-        elif strategy == ImportanceStrategy.GRAD_SQUARED:
-            return {name: grad.pow(2) for name, grad in gradient.items()}
-        
-        elif strategy == ImportanceStrategy.GRAD_NORMALIZED:
-            return compute_importance_grad_normalized(gradient)
-        
-        else:
-            raise ValueError(f"Unknown importance strategy: {strategy}")
-    
+            return {
+                name: self.fisher_cache.get(name, torch.ones_like(d)).to(d.device) * d.abs()
+                for name, d in delta_w.items()
+            }
+
+        if strategy == ImportanceStrategy.GRAD_SQUARED:
+            return {name: d.abs() * d.abs() for name, d in delta_w.items()}
+
+        return compute_importance_grad_normalized(delta_w)
+
     def topk_compress(
         self,
-        gradient: Dict[str, torch.Tensor],
+        delta_w: Dict[str, torch.Tensor],
         importance: Dict[str, torch.Tensor],
-    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        """Step 5: Top-k 压缩"""
-        strategy = self.config.topk_strategy.value
-        k_ratio = self.config.topk_ratio
-        weight_method = self.config.layer_weight_method.value
-        
-        sparse_gradient, masks = compress_gradient(
-            gradient=gradient,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], float]:
+        sparse_delta, masks = compress_gradient(
+            gradient=delta_w,
             importance_strategy=self.config.importance_strategy.value,
-            topk_strategy=strategy,
-            k_ratio=k_ratio,
-            weight_method=weight_method,
+            topk_strategy=self.config.topk_strategy.value,
+            k_ratio=self.config.topk_ratio,
+            weight_method=self.config.layer_weight_method.value,
+            importance=importance,
         )
-        
-        # 更新残差
+
         if self.config.use_residual:
-            self.residual_accumulator.update(gradient, masks)
-        
-        return sparse_gradient, masks
-    
-    def clip_gradient(
+            self.residual_accumulator.update(delta_w, masks)
+
+        total_params = sum(v.numel() for v in masks.values())
+        kept_params = sum(v.sum().item() for v in masks.values())
+        upload_ratio = float(kept_params / total_params) if total_params > 0 else 1.0
+        return sparse_delta, masks, upload_ratio
+
+    def clip_delta(
         self,
-        gradient: Dict[str, torch.Tensor],
+        delta_w: Dict[str, torch.Tensor],
         clip_norm: float,
     ) -> Tuple[Dict[str, torch.Tensor], float, bool]:
-        """
-        Step 6: 梯度裁剪
-        
-        返回：(裁剪后的梯度, L2范数, 是否被裁剪)
-        """
-        # 计算全局 L2 范数
-        total_norm_sq = sum(g.pow(2).sum() for g in gradient.values())
+        total_norm_sq = sum(d.pow(2).sum() for d in delta_w.values())
         total_norm = total_norm_sq.sqrt().item()
-        
+
         clipped = total_norm > clip_norm
-        
         if clipped:
-            scale = clip_norm / total_norm
-            clipped_gradient = {name: g * scale for name, g in gradient.items()}
+            scale = clip_norm / max(total_norm, 1e-12)
+            clipped_delta = {name: d * scale for name, d in delta_w.items()}
         else:
-            clipped_gradient = gradient
-        
-        return clipped_gradient, total_norm, clipped
-    
+            clipped_delta = delta_w
+
+        return clipped_delta, total_norm, clipped
+
     def add_dp_noise(
         self,
-        gradient: Dict[str, torch.Tensor],
+        delta_w: Dict[str, torch.Tensor],
         masks: Dict[str, torch.Tensor],
         importance: Dict[str, torch.Tensor],
-        epsilon_round: float,
-        clip_norm: float,
-        sampling_rate: float,
-    ) -> tuple:
-        """
-        Step 7: 差分隐私加噪
-        
-        支持同构噪声和异构噪声两种模式
-        
-        返回：(加噪后的梯度, 噪声强度sigma)
-        """
-        if not self.dp_config.enabled:
-            return gradient, 0.0
-        
-        # 计算稀疏率
-        total_params = sum(g.numel() for g in gradient.values())
-        selected_params = sum(m.sum().item() for m in masks.values())
-        sparsity_rate = selected_params / total_params if total_params > 0 else 1.0
-        
-        if self.dp_config.use_heterogeneous_noise:
-            # 异构噪声模式
-            noisy_grad, avg_sigma = self._add_heterogeneous_noise(
-                gradient, masks, importance,
-                epsilon_round, clip_norm
-            )
-            return noisy_grad, avg_sigma
-        else:
-            # 同构噪声模式
-            sigma = compute_base_noise_std(
-                epsilon=epsilon_round,
-                delta=self.dp_config.delta,
-                clip_norm=clip_norm,
-                sampling_rate=sampling_rate,
-                sparsity_rate=sparsity_rate,
-                use_subsampling_amplification=self.dp_config.use_subsampling_amplification,
-                use_sparsity_amplification=self.dp_config.use_sparsity_amplification,
-            )
-            
-            noisy_gradient = {}
-            for name, grad in gradient.items():
-                noisy_gradient[name] = add_noise_to_gradient(
-                    grad, sigma, generator=self.rng
-                )
-            return noisy_gradient, sigma
-    
+        sigma_base: float,
+    ) -> Tuple[Dict[str, torch.Tensor], float]:
+        if not self.dp_config.enabled or sigma_base <= 0:
+            return delta_w, 0.0
+
+        if not self.dp_config.use_heterogeneous_noise:
+            noisy = {
+                name: add_noise_to_tensor(d, sigma_base, generator=self.rng)
+                for name, d in delta_w.items()
+            }
+            return noisy, sigma_base
+
+        return self._add_heterogeneous_noise(delta_w, masks, importance, sigma_base)
+
     def _add_heterogeneous_noise(
         self,
-        gradient: Dict[str, torch.Tensor],
+        delta_w: Dict[str, torch.Tensor],
         masks: Dict[str, torch.Tensor],
         importance: Dict[str, torch.Tensor],
-        epsilon_total: float,
-        clip_norm: float,
-    ) -> tuple:
-        """
-        异构噪声添加（跨层统一分配隐私预算）
-        
-        返回：(加噪后的梯度, 平均噪声强度)
-        """
-        # Step 1: 收集所有层的信息
-        all_grads = []
-        all_masks = []
-        all_imps = []
-        layer_info = []  # 记录每层的起始位置和长度
-        
+        sigma_base: float,
+    ) -> Tuple[Dict[str, torch.Tensor], float]:
+        flat_delta = []
+        flat_mask = []
+        flat_importance = []
+        slices = []
+
         offset = 0
-        for name, grad in gradient.items():
-            if name not in masks:
-                continue
-            
-            flat_grad = grad.flatten()
-            flat_mask = masks[name].flatten()
-            flat_imp = importance.get(name, grad.abs()).flatten()
-            
-            all_grads.append(flat_grad)
-            all_masks.append(flat_mask)
-            all_imps.append(flat_imp)
-            
-            layer_info.append({
-                "name": name,
-                "shape": grad.shape,
-                "start": offset,
-                "length": flat_grad.numel()
-            })
-            offset += flat_grad.numel()
-        
-        if not all_grads:
-            return gradient, 0.0
-        
-        # Step 2: 拼接成全局张量
-        global_grad = torch.cat(all_grads)
-        global_mask = torch.cat(all_masks)
-        global_imp = torch.cat(all_imps)
-        
-        # 计算选中参数数量
-        num_selected = global_mask.sum().item()
-        if num_selected == 0:
-            return gradient, 0.0
-        
-        # Step 3: 统一分配隐私预算（所有参数共享 epsilon_total）
-        epsilon_i = allocate_heterogeneous_epsilon(
-            global_imp, global_mask, epsilon_total
+        for name, d in delta_w.items():
+            d_flat = d.flatten()
+            m_flat = masks.get(name, torch.ones_like(d)).flatten()
+            i_flat = importance.get(name, d.abs()).flatten()
+
+            flat_delta.append(d_flat)
+            flat_mask.append(m_flat)
+            flat_importance.append(i_flat)
+            slices.append((name, offset, offset + d_flat.numel(), d.shape))
+            offset += d_flat.numel()
+
+        if not flat_delta:
+            return delta_w, 0.0
+
+        global_delta = torch.cat(flat_delta)
+        global_mask = torch.cat(flat_mask)
+        global_importance = torch.cat(flat_importance)
+
+        rel_scales = allocate_relative_scales(
+            importance=global_importance,
+            mask=global_mask,
+            min_scale=self.dp_config.min_relative_noise,
+            max_scale=self.dp_config.max_relative_noise,
         )
-        
-        # Step 4: 计算噪声标准差
-        sigma_i = compute_heterogeneous_noise_std(
-            epsilon_i, self.dp_config.delta, clip_norm
+
+        noisy_global, avg_sigma = add_heterogeneous_noise(
+            tensor=global_delta,
+            sigma_base=sigma_base,
+            relative_scales=rel_scales,
+            mask=global_mask,
+            generator=self.rng,
         )
-        
-        # Step 5: 添加噪声
-        global_noisy = add_heterogeneous_noise(
-            global_grad, sigma_i, generator=self.rng
-        )
-        
-        # Step 6: 拆分回各层
-        noisy_gradient = {}
-        for info in layer_info:
-            name = info["name"]
-            start = info["start"]
-            length = info["length"]
-            shape = info["shape"]
-            
-            flat_noisy = global_noisy[start:start + length]
-            noisy_gradient[name] = flat_noisy.reshape(shape)
-        
-        # 对于没有 mask 的层，保持原样
-        for name, grad in gradient.items():
-            if name not in noisy_gradient:
-                noisy_gradient[name] = grad
-        
-        # 计算平均噪声强度
-        selected_sigmas = sigma_i[global_mask > 0]
-        avg_sigma = selected_sigmas.mean().item() if selected_sigmas.numel() > 0 else 0.0
-        
-        return noisy_gradient, avg_sigma
+
+        noisy_delta: Dict[str, torch.Tensor] = {}
+        for name, start, end, shape in slices:
+            noisy_delta[name] = noisy_global[start:end].reshape(shape)
+
+        return noisy_delta, avg_sigma
 
     def train_and_upload(
         self,
         global_weights: Dict[str, torch.Tensor],
         clip_norm: float,
-        epsilon_round: float,
-        sampling_rate: float,
+        sigma_base: float,
     ) -> ClientUpdate:
-        """
-        完整的训练流程
-        
-        执行 Step 1-8，返回上传内容
-        """
-        # Step 1: 接收全局模型
         self.receive_global_model(global_weights)
-        
-        # Step 2: 本地训练
-        gradient = self.local_train()
-        
-        # Step 3: 残差累积
-        gradient = self.accumulate_residual(gradient)
-        
-        # Step 4: 重要性评估
-        importance = self.compute_importance(gradient)
-        
-        # Step 5: Top-k 压缩
-        sparse_gradient, masks = self.topk_compress(gradient, importance)
-        
-        # Step 6: 梯度裁剪
-        clipped_gradient, l2_norm, clipped = self.clip_gradient(
-            sparse_gradient, clip_norm
+
+        delta_w = self.local_train()
+        delta_w = self.accumulate_residual(delta_w)
+
+        importance = self.compute_importance(delta_w)
+        sparse_delta, masks, upload_ratio = self.topk_compress(delta_w, importance)
+
+        clipped_delta, l2_norm, clipped = self.clip_delta(sparse_delta, clip_norm)
+
+        noisy_delta, noise_sigma = self.add_dp_noise(
+            clipped_delta,
+            masks,
+            importance,
+            sigma_base,
         )
-        
-        # Step 7: 差分隐私加噪
-        noisy_gradient, noise_sigma = self.add_dp_noise(
-            clipped_gradient, masks, importance,
-            epsilon_round, clip_norm, sampling_rate
-        )
-        
-        # Step 8: 构建上传内容
-        stat = 1.0 if clipped else 0.0  # 二值统计
+
+        stat = 1.0 if clipped else 0.0
         if self.config.stat_type.value == "l2_norm":
-            stat = l2_norm  # 实际 L2 范数
-        
+            stat = l2_norm
+
         return ClientUpdate(
-            gradient=noisy_gradient,
+            delta_w=noisy_delta,
             data_size=self.data_size,
             stat=stat,
             clipped=clipped,
             noise_sigma=noise_sigma,
+            upload_ratio=upload_ratio,
         )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 快速验证
-# ══════════════════════════════════════════════════════════════════════════════
-
 if __name__ == "__main__":
-    import torch
-    from torch.utils.data import TensorDataset, DataLoader
-    
-    print("=== 客户端模块测试 ===\n")
-    
-    # 创建简单模型
-    class SimpleModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.fc1 = nn.Linear(32, 16)
-            self.fc2 = nn.Linear(16, 10)
-        
-        def forward(self, x):
-            x = torch.relu(self.fc1(x))
-            return self.fc2(x)
-    
-    device = torch.device("cpu")
-    model = SimpleModel()
-    
-    # 创建假数据
-    X = torch.randn(100, 32)
-    y = torch.randint(0, 10, (100,))
-    dataset = TensorDataset(X, y)
-    dataloader = DataLoader(dataset, batch_size=10, shuffle=True)
-    
-    # 配置
-    config = ClientConfig()
-    config.training_strategy = TrainingStrategy.CONTRASTIVE
-    config.topk_ratio = 0.3
-    
-    dp_config = DPConfig()
-    dp_config.enabled = True
-    dp_config.use_heterogeneous_noise = True
-    
-    # 创建客户端
-    client = FLClient(
-        client_id=0,
-        model=model,
-        dataloader=dataloader,
-        config=config,
-        dp_config=dp_config,
-        device=device,
-    )
-    
-    # 模拟全局模型
-    global_weights = model.state_dict()
-    
-    # 执行训练
-    update = client.train_and_upload(
-        global_weights=global_weights,
-        clip_norm=1.0,
-        epsilon_round=0.8,
-        sampling_rate=0.1,
-    )
-    
-    print(f"客户端 {client.client_id} 训练完成:")
-    print(f"  数据量: {update.data_size}")
-    print(f"  是否被裁剪: {update.clipped}")
-    print(f"  统计值: {update.stat:.4f}")
-    print(f"  梯度层数: {len(update.gradient)}")
-    for name, grad in update.gradient.items():
-        print(f"    {name}: {grad.shape}, 非零率: {(grad != 0).float().mean():.2%}")
-    
-    print("\n✓ 客户端测试通过")
+    print("client module ready")
