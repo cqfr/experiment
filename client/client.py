@@ -35,6 +35,8 @@ class ClientUpdate:
     clipped: bool
     noise_sigma: float = 0.0
     upload_ratio: float = 1.0
+    importance_vector: Optional[torch.Tensor] = None
+    mask_vector: Optional[torch.Tensor] = None
 
 
 class FLClient:
@@ -330,6 +332,8 @@ class FLClient:
         global_weights: Dict[str, torch.Tensor],
         clip_norm: float,
         sigma_base: float,
+        return_importance_snapshot: bool = False,
+        importance_max_elements: int = 4096,
     ) -> ClientUpdate:
         self.receive_global_model(global_weights)
 
@@ -352,6 +356,18 @@ class FLClient:
         if self.config.stat_type.value == "l2_norm":
             stat = l2_norm
 
+        importance_vector = None
+        mask_vector = None
+        if return_importance_snapshot:
+            importance_vector = self._build_vector_snapshot(
+                tensors=importance,
+                max_elements=importance_max_elements,
+            )
+            mask_vector = self._build_vector_snapshot(
+                tensors=masks,
+                max_elements=importance_max_elements,
+            )
+
         return ClientUpdate(
             delta_w=noisy_delta,
             data_size=self.data_size,
@@ -359,7 +375,24 @@ class FLClient:
             clipped=clipped,
             noise_sigma=noise_sigma,
             upload_ratio=upload_ratio,
+            importance_vector=importance_vector,
+            mask_vector=mask_vector,
         )
+
+    @staticmethod
+    def _build_vector_snapshot(
+        tensors: Dict[str, torch.Tensor],
+        max_elements: int = 4096,
+    ) -> torch.Tensor:
+        """Flatten dict tensors and keep a bounded-size snapshot for visualization."""
+        if not tensors:
+            return torch.zeros(1)
+        flat = torch.cat([t.detach().float().flatten().cpu() for t in tensors.values()])
+        if flat.numel() <= max_elements:
+            return flat
+        # Uniform subsampling keeps spatial coverage of the full vector.
+        idx = torch.linspace(0, flat.numel() - 1, steps=max_elements).long()
+        return flat[idx]
 
 
 if __name__ == "__main__":

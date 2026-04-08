@@ -41,12 +41,18 @@ python train.py --experiment dp_fedsam --dataset cifar10 --epsilon 8 --num_round
 
 # Ours
 python train.py --experiment proposed --dataset cifar10 --epsilon 8 --topk_ratio 0.1 --num_rounds 100
+
+# Ours + importance matrix visualization (every 5 rounds, client 0)
+python train.py --experiment proposed --dataset cifar10 --epsilon 8 --topk_ratio 0.1 --num_rounds 100 --importance_viz --importance_viz_interval 5 --importance_viz_client 0
 ```
 
 `train.py` 关键参数：
 
 - `--experiment`: `fedavg | dp_fedavg | dp_fedsam | proposed`
 - `--dataset`: `cifar10 | mnist`
+- `--importance_viz`: save importance heatmaps to `logs/<exp>/importance_viz/`
+- `--importance_viz_interval`: visualization interval by round
+- `--importance_viz_client`: target client id for visualization
 - `--num_rounds`
 - `--num_clients`
 - `--clients_per_round`

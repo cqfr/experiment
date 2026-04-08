@@ -4,10 +4,11 @@
 
 import argparse
 import json
+import math
 import os
 import random
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -114,19 +115,33 @@ class FLTrainer:
         stats: List[float] = []
         noise_sigmas: List[float] = []
         upload_ratios: List[float] = []
+        viz_client_id: Optional[int] = None
+        viz_importance: Optional[torch.Tensor] = None
+        viz_mask: Optional[torch.Tensor] = None
 
         for client_id in selected_ids:
             client = self.clients[client_id]
+            need_viz = (
+                self.config.importance_viz_enabled
+                and (round_num % max(1, self.config.importance_viz_interval) == 0)
+                and (client_id == self.config.importance_viz_client)
+            )
             update = client.train_and_upload(
                 global_weights=global_weights,
                 clip_norm=clip_norm,
                 sigma_base=sigma_base,
+                return_importance_snapshot=need_viz,
+                importance_max_elements=self.config.importance_viz_max_elements,
             )
             client_deltas.append(update.delta_w)
             data_sizes.append(update.data_size)
             stats.append(update.stat)
             noise_sigmas.append(update.noise_sigma)
             upload_ratios.append(update.upload_ratio)
+            if need_viz and update.importance_vector is not None:
+                viz_client_id = client_id
+                viz_importance = update.importance_vector
+                viz_mask = update.mask_vector
 
         aggregated = self.server.aggregate(
             client_updates=client_deltas,
@@ -147,6 +162,13 @@ class FLTrainer:
             float(np.mean(upload_ratios)) if upload_ratios else 1.0
         )
         train_metrics["sigma_base"] = float(sigma_base)
+        if viz_importance is not None and viz_client_id is not None:
+            self._save_importance_visualization(
+                round_num=round_num,
+                client_id=viz_client_id,
+                importance_vector=viz_importance,
+                mask_vector=viz_mask,
+            )
 
         if self.privacy_accountant is not None:
             eps_spent = self.privacy_accountant.consume_round(
@@ -160,6 +182,71 @@ class FLTrainer:
             )
 
         return train_metrics
+
+    def _save_importance_visualization(
+        self,
+        round_num: int,
+        client_id: int,
+        importance_vector: torch.Tensor,
+        mask_vector: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Save heatmap + raw snapshot for importance/mask vectors."""
+        viz_dir = os.path.join(self.config.log_dir, "importance_viz")
+        os.makedirs(viz_dir, exist_ok=True)
+
+        vec = importance_vector.detach().float().cpu().numpy()
+        side = int(math.ceil(math.sqrt(vec.size)))
+        padded = np.full((side * side,), np.nan, dtype=np.float32)
+        padded[: vec.size] = vec
+        imp_mat = padded.reshape(side, side)
+
+        mask_mat = None
+        if mask_vector is not None:
+            mvec = mask_vector.detach().float().cpu().numpy()
+            mpad = np.full((side * side,), np.nan, dtype=np.float32)
+            mpad[: min(mvec.size, side * side)] = mvec[: side * side]
+            mask_mat = mpad.reshape(side, side)
+
+        npz_path = os.path.join(viz_dir, f"round_{round_num:04d}_client_{client_id}.npz")
+        np.savez_compressed(
+            npz_path,
+            importance_vector=vec,
+            mask_vector=(
+                mask_vector.detach().float().cpu().numpy()
+                if mask_vector is not None
+                else np.array([], dtype=np.float32)
+            ),
+        )
+
+        try:
+            import matplotlib.pyplot as plt
+
+            cols = 2 if mask_mat is not None else 1
+            fig, axes = plt.subplots(1, cols, figsize=(6 * cols, 5), dpi=120)
+            if cols == 1:
+                axes = [axes]
+
+            ax0 = axes[0]
+            im0 = ax0.imshow(np.log1p(np.nan_to_num(imp_mat, nan=0.0)), cmap="viridis", aspect="auto")
+            ax0.set_title(f"Importance Heatmap (R{round_num}, C{client_id})")
+            ax0.set_xlabel("Index")
+            ax0.set_ylabel("Index")
+            fig.colorbar(im0, ax=ax0, fraction=0.046, pad=0.04)
+
+            if mask_mat is not None:
+                ax1 = axes[1]
+                im1 = ax1.imshow(np.nan_to_num(mask_mat, nan=0.0), cmap="gray_r", vmin=0.0, vmax=1.0, aspect="auto")
+                ax1.set_title("Top-k Mask Snapshot")
+                ax1.set_xlabel("Index")
+                ax1.set_ylabel("Index")
+                fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+
+            fig.tight_layout()
+            png_path = os.path.join(viz_dir, f"round_{round_num:04d}_client_{client_id}.png")
+            fig.savefig(png_path)
+            plt.close(fig)
+        except Exception as exc:
+            print(f"[importance_viz] plot failed at round {round_num}: {exc}")
 
     def evaluate(self) -> Dict[str, float]:
         return self.server.evaluate(self.test_loader)
@@ -350,6 +437,12 @@ class FLTrainer:
                 "rdp_steps_per_round": config.dp.rdp_steps_per_round,
                 "trusted_server_for_stats": config.dp.trusted_server_for_stats,
             },
+            "importance_viz": {
+                "enabled": config.importance_viz_enabled,
+                "interval": config.importance_viz_interval,
+                "client_id": config.importance_viz_client,
+                "max_elements": config.importance_viz_max_elements,
+            },
         }
 
 
@@ -379,6 +472,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alpha", type=float, default=0.5)
     parser.add_argument("--dataset", type=str, choices=["cifar10", "mnist"], default="cifar10")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--importance_viz", action="store_true")
+    parser.add_argument("--importance_viz_interval", type=int, default=10)
+    parser.add_argument("--importance_viz_client", type=int, default=0)
+    parser.add_argument("--importance_viz_max_elements", type=int, default=4096)
     return parser.parse_args()
 
 
@@ -401,6 +498,10 @@ def main() -> None:
     config.alpha = args.alpha
     config.dataset = args.dataset
     config.seed = args.seed
+    config.importance_viz_enabled = args.importance_viz
+    config.importance_viz_interval = args.importance_viz_interval
+    config.importance_viz_client = args.importance_viz_client
+    config.importance_viz_max_elements = args.importance_viz_max_elements
 
     if args.experiment in {"proposed", "dp_fedavg", "dp_fedsam"}:
         config.client.topk_ratio = args.topk_ratio

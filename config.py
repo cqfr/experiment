@@ -184,6 +184,12 @@ class ExperimentConfig:
     save_dir: str = "./checkpoints"
     log_dir: str = "./logs"
 
+    # Optional importance visualization (off by default)
+    importance_viz_enabled: bool = False
+    importance_viz_interval: int = 10
+    importance_viz_client: int = 0
+    importance_viz_max_elements: int = 4096
+
 
 def get_fedavg_config() -> ExperimentConfig:
     """FedAvg baseline (no DP, no compression)."""
