@@ -4,7 +4,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import torch
 
@@ -169,6 +169,84 @@ def add_noise_to_tensor(
     return tensor + noise
 
 
+def compute_weighted_sensitivity(
+    client_weights: Sequence[float],
+    clip_norm: float,
+) -> float:
+    """Sensitivity upper bound for weighted aggregation under add/remove adjacency."""
+
+    if clip_norm < 0:
+        raise ValueError("clip_norm must be >= 0")
+    if not client_weights:
+        return 0.0
+
+    p_max = max(abs(float(w)) for w in client_weights)
+    return p_max * clip_norm
+
+
+def allocate_client_noise_stds(
+    client_weights: Sequence[float],
+    sigma_agg: float,
+    strategy: str = "uniform",
+    client_importance: Optional[Sequence[float]] = None,
+    max_sigma_scale: float = 10.0,
+) -> list[float]:
+    """Back-solve per-client base stds from target aggregate std.
+
+    Constraint:
+        sum_i p_i^2 * sigma_i^2 == sigma_agg^2
+    """
+
+    if sigma_agg <= 0:
+        return [0.0 for _ in client_weights]
+    if not client_weights:
+        return []
+
+    p = [max(0.0, float(w)) for w in client_weights]
+    p_sum = sum(p)
+    if p_sum <= 0:
+        raise ValueError("client_weights must contain positive values")
+    p = [w / p_sum for w in p]
+
+    eps = 1e-12
+
+    if strategy == "uniform":
+        denom = math.sqrt(sum(w * w for w in p))
+        sigma_base = sigma_agg / max(denom, eps)
+        sigmas = [sigma_base for _ in p]
+    elif strategy == "heterogeneous":
+        if client_importance is None:
+            raise ValueError("client_importance is required for heterogeneous strategy")
+        if len(client_importance) != len(p):
+            raise ValueError("client_importance length mismatch")
+
+        raw_r = [1.0 / max(float(imp), eps) for imp in client_importance]
+        total_r = sum(raw_r)
+        if total_r <= 0:
+            raise ValueError("invalid client_importance values")
+        r = [v / total_r for v in raw_r]
+
+        sigmas = [
+            sigma_agg * math.sqrt(r_i) / max(abs(p_i), eps)
+            for p_i, r_i in zip(p, r)
+        ]
+
+        if max_sigma_scale > 0:
+            max_sigma = max_sigma_scale * sigma_agg
+            sigmas = [min(s, max_sigma) for s in sigmas]
+    else:
+        raise ValueError(f"Unknown client noise allocation strategy: {strategy}")
+
+    # Renormalize to satisfy exact aggregate variance after optional clipping.
+    target_var = sigma_agg * sigma_agg
+    actual_var = sum((p_i * p_i) * (s_i * s_i) for p_i, s_i in zip(p, sigmas))
+    if actual_var > 0:
+        scale = math.sqrt(target_var / actual_var)
+        sigmas = [s * scale for s in sigmas]
+
+    return sigmas
+
+
 def allocate_relative_scales(
     importance: torch.Tensor,
     mask: torch.Tensor,
@@ -208,10 +286,10 @@ def normalize_relative_scales(
     scales: torch.Tensor,
     mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Normalize scales so harmonic privacy-equivalent sigma stays unchanged.
+    """Normalize scales so per-client noise variance budget stays unchanged.
 
     We enforce:
-        mean_selected(1 / sigma_i^2) = 1 / sigma_base^2
+        mean_selected(sigma_i^2) = sigma_base^2
     with sigma_i = sigma_base * scale_i * gamma.
     """
 
@@ -220,9 +298,9 @@ def normalize_relative_scales(
         return scales
 
     selected_scales = scales[selected].clamp(min=1e-8)
-    gamma = torch.sqrt(torch.mean(1.0 / (selected_scales**2)))
+    gamma = torch.sqrt(torch.mean(selected_scales**2))
     normalized = scales.clone()
-    normalized[selected] = selected_scales * gamma
+    normalized[selected] = selected_scales / gamma
     return normalized
 
 def add_heterogeneous_noise(

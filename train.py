@@ -23,7 +23,11 @@ from config import (
     get_proposed_config,
 )
 from data.utils import get_dataloader
-from dp.noise import RDPAccountant
+from dp.noise import (
+    RDPAccountant,
+    allocate_client_noise_stds,
+    compute_weighted_sensitivity,
+)
 from models.resnet import ResNet18
 from server.server import FLServer
 
@@ -79,6 +83,7 @@ class FLTrainer:
             "privacy_spent": [],
             "upload_ratio": [],
             "noise_multiplier": [],
+            "sigma_agg": [],
             "sigma_base": [],
         }
 
@@ -99,19 +104,48 @@ class FLTrainer:
     def train_round(self, round_num: int) -> Dict[str, float]:
         clip_norm = self.server.get_clip_norm()
         sampling_rate = self.config.clients_per_round / self.config.num_clients
-        effective_rate = sampling_rate * self.config.client.topk_ratio
+        q_accounting = sampling_rate
+        if self.config.dp.account_for_topk_in_q:
+            q_accounting = sampling_rate * self.config.client.topk_ratio
+
+        selected_ids = self._select_clients(self.config.clients_per_round)
+        selected_sizes = [self.clients[idx].data_size for idx in selected_ids]
+        total_selected = sum(selected_sizes)
+        if total_selected > 0:
+            client_weights = [size / total_selected for size in selected_sizes]
+        else:
+            client_weights = [
+                1.0 / max(1, len(selected_ids)) for _ in selected_ids
+            ]
+
+        sigma_by_client = [0.0 for _ in selected_ids]
+        sigma_agg = 0.0
+        sensitivity_l2 = 0.0
 
         if self.privacy_accountant is not None:
             noise_multiplier = self.privacy_accountant.solve_noise_multiplier_for_round(
-                q=effective_rate,
+                q=q_accounting,
                 steps=self.config.dp.rdp_steps_per_round,
             )
-            sigma_base = noise_multiplier * clip_norm
+
+            sensitivity_l2 = compute_weighted_sensitivity(
+                client_weights=client_weights,
+                clip_norm=clip_norm,
+            )
+            sigma_agg = noise_multiplier * sensitivity_l2
+            client_importance = None
+            if self.config.dp.client_noise_allocation == "heterogeneous":
+                client_importance = [float(s) for s in selected_sizes]
+            sigma_by_client = allocate_client_noise_stds(
+                client_weights=client_weights,
+                sigma_agg=sigma_agg,
+                strategy=self.config.dp.client_noise_allocation,
+                client_importance=client_importance,
+                max_sigma_scale=self.config.dp.client_variance_max_scale,
+            )
         else:
             noise_multiplier = 0.0
-            sigma_base = 0.0
-
-        selected_ids = self._select_clients(self.config.clients_per_round)
+            sigma_agg = 0.0
         global_weights = self.server.get_global_weights()
 
         client_deltas: List[Dict[str, torch.Tensor]] = []
@@ -123,7 +157,7 @@ class FLTrainer:
         viz_importance: Optional[torch.Tensor] = None
         viz_mask: Optional[torch.Tensor] = None
 
-        for client_id in selected_ids:
+        for local_idx, client_id in enumerate(selected_ids):
             client = self.clients[client_id]
             need_viz = (
                 self.config.importance_viz_enabled
@@ -133,7 +167,7 @@ class FLTrainer:
             update = client.train_and_upload(
                 global_weights=global_weights,
                 clip_norm=clip_norm,
-                sigma_base=sigma_base,
+                sigma_base=sigma_by_client[local_idx],
                 return_importance_snapshot=need_viz,
                 importance_max_elements=self.config.importance_viz_max_elements,
             )
@@ -166,7 +200,9 @@ class FLTrainer:
             float(np.mean(upload_ratios)) if upload_ratios else 1.0
         )
         train_metrics["noise_multiplier"] = float(noise_multiplier)
-        train_metrics["sigma_base"] = float(sigma_base)
+        train_metrics["sigma_agg"] = float(sigma_agg)
+        train_metrics["sigma_base"] = float(np.mean(sigma_by_client)) if sigma_by_client else 0.0
+        train_metrics["sensitivity_l2"] = float(sensitivity_l2)
         if viz_importance is not None and viz_client_id is not None:
             self._save_importance_visualization(
                 round_num=round_num,
@@ -178,7 +214,7 @@ class FLTrainer:
         if self.privacy_accountant is not None:
             eps_spent = self.privacy_accountant.consume_round(
                 noise_multiplier=noise_multiplier,
-                q=effective_rate,
+                q=q_accounting,
                 steps=self.config.dp.rdp_steps_per_round,
             )
             train_metrics["epsilon_spent"] = float(eps_spent)
@@ -279,6 +315,7 @@ class FLTrainer:
             self.history["clip_history"].append(train_metrics.get("new_clip", 0.0))
             self.history["upload_ratio"].append(train_metrics.get("avg_upload_ratio", 1.0))
             self.history["noise_multiplier"].append(train_metrics.get("noise_multiplier", 0.0))
+            self.history["sigma_agg"].append(train_metrics.get("sigma_agg", 0.0))
             self.history["sigma_base"].append(train_metrics.get("sigma_base", 0.0))
 
             if self.privacy_accountant is not None:
@@ -296,7 +333,8 @@ class FLTrainer:
                     msg += (
                         f" | eps={train_metrics.get('epsilon_spent', 0.0):.4f}"
                         f" | z={train_metrics.get('noise_multiplier', 0.0):.4f}"
-                        f" | sigma={train_metrics.get('sigma_base', 0.0):.4f}"
+                        f" | sigma_agg={train_metrics.get('sigma_agg', 0.0):.4f}"
+                        f" | sigma_client={train_metrics.get('sigma_base', 0.0):.4f}"
                     )
                 tqdm.write(msg)
 
@@ -357,6 +395,7 @@ class FLTrainer:
             "noise_sigma": [m.get("avg_noise_sigma", 0.0) for m in self.history["train_metrics"]],
             "upload_ratio": self.history["upload_ratio"],
             "noise_multiplier": self.history["noise_multiplier"],
+            "sigma_agg": self.history["sigma_agg"],
             "sigma_base": self.history["sigma_base"],
         }
 
@@ -443,6 +482,9 @@ class FLTrainer:
                 "max_relative_noise": config.dp.max_relative_noise,
                 "rdp_orders": list(config.dp.rdp_orders),
                 "rdp_steps_per_round": config.dp.rdp_steps_per_round,
+                "client_noise_allocation": config.dp.client_noise_allocation,
+                "client_variance_max_scale": config.dp.client_variance_max_scale,
+                "account_for_topk_in_q": config.dp.account_for_topk_in_q,
                 "trusted_server_for_stats": config.dp.trusted_server_for_stats,
             },
             "importance_viz": {
@@ -484,6 +526,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--importance_viz_interval", type=int, default=10)
     parser.add_argument("--importance_viz_client", type=int, default=0)
     parser.add_argument("--importance_viz_max_elements", type=int, default=4096)
+    parser.add_argument(
+        "--client_noise_allocation",
+        type=str,
+        choices=["uniform", "heterogeneous"],
+        default="uniform",
+    )
+    parser.add_argument("--client_variance_max_scale", type=float, default=10.0)
+    parser.add_argument("--account_for_topk_in_q", action="store_true")
     return parser.parse_args()
 
 
@@ -510,6 +560,9 @@ def main() -> None:
     config.importance_viz_interval = args.importance_viz_interval
     config.importance_viz_client = args.importance_viz_client
     config.importance_viz_max_elements = args.importance_viz_max_elements
+    config.dp.client_noise_allocation = args.client_noise_allocation
+    config.dp.client_variance_max_scale = args.client_variance_max_scale
+    config.dp.account_for_topk_in_q = args.account_for_topk_in_q
 
     if args.experiment in {"proposed", "dp_fedavg", "dp_fedsam"}:
         config.client.topk_ratio = args.topk_ratio

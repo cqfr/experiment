@@ -153,6 +153,17 @@ class DPConfig:
     )
     rdp_steps_per_round: int = 1
 
+    # Client-side noise allocation:
+    # 1) solve round noise multiplier z from accountant;
+    # 2) build target aggregate std sigma_agg = z * Delta2;
+    # 3) back-solve each client's base std from variance constraints.
+    client_noise_allocation: Literal["uniform", "heterogeneous"] = "uniform"
+    client_variance_max_scale: float = 10.0
+
+    # Whether to multiply q by top-k ratio in accountant.
+    # Keep False by default to align q with client participation sampling.
+    account_for_topk_in_q: bool = False
+
     # Explicit modeling assumption accepted by the user.
     trusted_server_for_stats: bool = True
 
