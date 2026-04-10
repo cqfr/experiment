@@ -18,6 +18,7 @@ def compute_fisher_information(
     """Estimate diagonal Fisher information from mini-batches."""
 
     model.eval()
+    # 创建一个与模型参数同结构的字典，初始值为全零，用于存储Fisher信息
     fisher: Dict[str, torch.Tensor] = {
         name: torch.zeros_like(param.data)
         for name, param in model.named_parameters()
@@ -27,6 +28,7 @@ def compute_fisher_information(
     total_samples = 0
     criterion = nn.CrossEntropyLoss(reduction="sum")
 
+# 对角fisher矩阵
     for batch_idx, (data, target) in enumerate(dataloader):
         if batch_idx >= num_batches:
             break
@@ -83,10 +85,10 @@ def compute_importance_grad_normalized(
 
 def topk_global(importance: Dict[str, torch.Tensor], k_ratio: float) -> Dict[str, torch.Tensor]:
     all_values = torch.cat([imp.flatten() for imp in importance.values()])
-    total = all_values.numel()
+    total = all_values.numel() # 计算所有重要性值的总数量
     k = max(1, int(total * k_ratio))
 
-    threshold = torch.topk(all_values, k).values[-1]
+    threshold = torch.topk(all_values, k).values[-1] # 通过阈值来计算的
     return {name: (imp >= threshold).float() for name, imp in importance.items()}
 
 
@@ -106,10 +108,10 @@ def topk_layer_norm_global(
     importance: Dict[str, torch.Tensor],
     k_ratio: float,
 ) -> Dict[str, torch.Tensor]:
-    layer_norm = compute_importance_grad_normalized(importance)
+    layer_norm = compute_importance_grad_normalized(importance) # 对每一层的重要性进行归一化
     return topk_global(layer_norm, k_ratio)
 
-
+# 这尼玛是什么神人想出来的，感觉没什么用啊。，意义不明，自相矛盾了，有点
 def topk_weighted_layer_norm(
     importance: Dict[str, torch.Tensor],
     k_ratio: float,
@@ -118,7 +120,7 @@ def topk_weighted_layer_norm(
     layer_norm = compute_importance_grad_normalized(importance)
     layer_weights: Dict[str, float] = {}
 
-    for name, imp in importance.items():
+    for name, imp in importance.items(): #感觉仅适用于fisher矩阵
         flat = imp.flatten()
         if weight_method == "median":
             layer_weights[name] = flat.median().item()
@@ -155,7 +157,7 @@ class ResidualAccumulator:
         if not self.residual:
             return gradient
         return {
-            name: grad + self.residual.get(name, torch.zeros_like(grad))
+            name: grad + self.residual.get(name, torch.zeros_like(grad))# 找得到name就返回name对应的residual，否则返回一个全零的tensor
             for name, grad in gradient.items()
         }
 
@@ -180,7 +182,7 @@ def compress_gradient(
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
     """Unified API for importance scoring + top-k masking."""
 
-    if importance is None:
+    if importance is None: # 如果没有就重新计算一遍
         if importance_strategy == "fisher_grad":
             if fisher is None:
                 raise ValueError("fisher is required when using fisher_grad")

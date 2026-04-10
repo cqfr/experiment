@@ -74,7 +74,7 @@ class FLClient:
     def local_train(self) -> Dict[str, torch.Tensor]:
         """Run local optimization and return model delta: Delta_w = w_local - w_global."""
 
-        self.model.train()
+        self.model.train() #训练模式
         optimizer = optim.SGD(
             self.model.parameters(),
             lr=self.config.lr,
@@ -228,6 +228,7 @@ class FLClient:
             topk_strategy=self.config.topk_strategy.value,
             k_ratio=self.config.topk_ratio,
             weight_method=self.config.layer_weight_method.value,
+            fisher=self.fisher_cache,#fisher_cashe如果没有的话，有时候会报错
             importance=importance,
         )
 
@@ -239,6 +240,7 @@ class FLClient:
         upload_ratio = float(kept_params / total_params) if total_params > 0 else 1.0
         return sparse_delta, masks, upload_ratio
 
+# 真不会超过这个阈值吗？
     def clip_delta(
         self,
         delta_w: Dict[str, torch.Tensor],
@@ -311,6 +313,9 @@ class FLClient:
             mask=global_mask,
             min_scale=self.dp_config.min_relative_noise,
             max_scale=self.dp_config.max_relative_noise,
+            mode=self.dp_config.relative_noise_mode,
+            alpha=self.dp_config.relative_noise_alpha,
+            eps=self.dp_config.relative_noise_eps,
         )
 
         noisy_global, avg_sigma = add_heterogeneous_noise(
@@ -351,7 +356,7 @@ class FLClient:
             importance,
             sigma_base,
         )
-
+#这里是关于梯度裁剪的返回值，默认是l2范数，也可以直接返回二值统计量
         stat = 1.0 if clipped else 0.0
         if self.config.stat_type.value == "l2_norm":
             stat = l2_norm

@@ -83,6 +83,7 @@ class FLTrainer:
             "privacy_spent": [],
             "upload_ratio": [],
             "noise_multiplier": [],
+            "noise_multiplier_base": [],
             "sigma_agg": [],
             "sigma_base": [],
         }
@@ -121,18 +122,31 @@ class FLTrainer:
         sigma_by_client = [0.0 for _ in selected_ids]
         sigma_agg = 0.0
         sensitivity_l2 = 0.0
+        noise_multiplier = 0.0
+        noise_multiplier_base = 0.0
+        relative_noise_rdp_factor = 1.0
 
         if self.privacy_accountant is not None:
+            if (
+                self.config.dp.use_heterogeneous_noise
+                and self.config.dp.account_for_relative_noise_in_rdp
+            ):
+                min_rel = max(float(self.config.dp.min_relative_noise), 1e-12)
+                max_rel = max(float(self.config.dp.max_relative_noise), min_rel)
+                # Conservative lower bound after RMS normalization.
+                relative_noise_rdp_factor = min_rel / max_rel
+
             noise_multiplier = self.privacy_accountant.solve_noise_multiplier_for_round(
                 q=q_accounting,
                 steps=self.config.dp.rdp_steps_per_round,
             )
+            noise_multiplier_base = noise_multiplier / max(relative_noise_rdp_factor, 1e-12)
 
             sensitivity_l2 = compute_weighted_sensitivity(
                 client_weights=client_weights,
                 clip_norm=clip_norm,
             )
-            sigma_agg = noise_multiplier * sensitivity_l2
+            sigma_agg = noise_multiplier_base * sensitivity_l2
             client_importance = None
             if self.config.dp.client_noise_allocation == "heterogeneous":
                 client_importance = [float(s) for s in selected_sizes]
@@ -144,7 +158,6 @@ class FLTrainer:
                 max_sigma_scale=self.config.dp.client_variance_max_scale,
             )
         else:
-            noise_multiplier = 0.0
             sigma_agg = 0.0
         global_weights = self.server.get_global_weights()
 
@@ -200,6 +213,8 @@ class FLTrainer:
             float(np.mean(upload_ratios)) if upload_ratios else 1.0
         )
         train_metrics["noise_multiplier"] = float(noise_multiplier)
+        train_metrics["noise_multiplier_base"] = float(noise_multiplier_base)
+        train_metrics["relative_noise_rdp_factor"] = float(relative_noise_rdp_factor)
         train_metrics["sigma_agg"] = float(sigma_agg)
         train_metrics["sigma_base"] = float(np.mean(sigma_by_client)) if sigma_by_client else 0.0
         train_metrics["sensitivity_l2"] = float(sensitivity_l2)
@@ -315,6 +330,7 @@ class FLTrainer:
             self.history["clip_history"].append(train_metrics.get("new_clip", 0.0))
             self.history["upload_ratio"].append(train_metrics.get("avg_upload_ratio", 1.0))
             self.history["noise_multiplier"].append(train_metrics.get("noise_multiplier", 0.0))
+            self.history["noise_multiplier_base"].append(train_metrics.get("noise_multiplier_base", 0.0))
             self.history["sigma_agg"].append(train_metrics.get("sigma_agg", 0.0))
             self.history["sigma_base"].append(train_metrics.get("sigma_base", 0.0))
 
@@ -333,6 +349,7 @@ class FLTrainer:
                     msg += (
                         f" | eps={train_metrics.get('epsilon_spent', 0.0):.4f}"
                         f" | z={train_metrics.get('noise_multiplier', 0.0):.4f}"
+                        f" | z_base={train_metrics.get('noise_multiplier_base', 0.0):.4f}"
                         f" | sigma_agg={train_metrics.get('sigma_agg', 0.0):.4f}"
                         f" | sigma_client={train_metrics.get('sigma_base', 0.0):.4f}"
                     )
@@ -395,6 +412,7 @@ class FLTrainer:
             "noise_sigma": [m.get("avg_noise_sigma", 0.0) for m in self.history["train_metrics"]],
             "upload_ratio": self.history["upload_ratio"],
             "noise_multiplier": self.history["noise_multiplier"],
+            "noise_multiplier_base": self.history["noise_multiplier_base"],
             "sigma_agg": self.history["sigma_agg"],
             "sigma_base": self.history["sigma_base"],
         }
@@ -480,6 +498,10 @@ class FLTrainer:
                 "use_heterogeneous_noise": config.dp.use_heterogeneous_noise,
                 "min_relative_noise": config.dp.min_relative_noise,
                 "max_relative_noise": config.dp.max_relative_noise,
+                "relative_noise_mode": config.dp.relative_noise_mode,
+                "relative_noise_alpha": config.dp.relative_noise_alpha,
+                "relative_noise_eps": config.dp.relative_noise_eps,
+                "account_for_relative_noise_in_rdp": config.dp.account_for_relative_noise_in_rdp,
                 "rdp_orders": list(config.dp.rdp_orders),
                 "rdp_steps_per_round": config.dp.rdp_steps_per_round,
                 "client_noise_allocation": config.dp.client_noise_allocation,

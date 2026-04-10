@@ -74,6 +74,7 @@ class FLServer:
                 global_update[name] = acc
         return global_update
 
+# 这里需要对stat的类型做一个区分吧，需要修改
     def _aggregate_stats(self, stats: List[float], method: StatsAggMethod) -> Dict[str, float]:
         if not stats:
             return {
@@ -90,7 +91,7 @@ class FLServer:
             "q25": float(np.quantile(arr, 0.25)),
             "q75": float(np.quantile(arr, 0.75)),
             "count": float(arr.size),
-            "fraction_clipped": float(np.mean(arr > 0.5)),
+            "fraction_clipped": float(np.mean(arr > self.clip_norm)),
         }
         if method == StatsAggMethod.ALL:
             out["mean"] = float(np.mean(arr))
@@ -125,13 +126,13 @@ class FLServer:
     def _update_clip_norm(self, stats: Dict[str, float]) -> None:
         method = self.config.clip_update_method
 
-        if method == ClipUpdateMethod.ADAPTIVE:
+        if method == ClipUpdateMethod.ADAPTIVE: # 对应于binary的统计量
             fraction_clipped = float(stats.get("fraction_clipped", 0.5))
             if fraction_clipped > self.config.target_quantile:
                 self.clip_norm *= 1.0 + self.config.clip_lr
             else:
                 self.clip_norm *= 1.0 - self.config.clip_lr
-        elif method == ClipUpdateMethod.EMA:
+        elif method == ClipUpdateMethod.EMA: # 对应于l2_norm的统计量
             median = float(stats.get("median", self.clip_norm))
             alpha = self.config.ema_alpha
             self.clip_norm = alpha * self.clip_norm + (1.0 - alpha) * median

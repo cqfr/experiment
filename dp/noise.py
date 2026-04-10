@@ -252,34 +252,67 @@ def allocate_relative_scales(
     mask: torch.Tensor,
     min_scale: float = 0.3,
     max_scale: float = 3.0,
+    mode: str = "inverse_power",
+    alpha: float = 1.0,
+    eps: float = 1e-6,
 ) -> torch.Tensor:
     """Create relative std scales: important entries get less noise.
 
     This returns per-parameter multiplicative factors before normalization.
+    - mode="inverse_power": sigma^2 proportional to 1/(importance+eps)^alpha.
+    - mode="linear": legacy linear interpolation in [min_scale, max_scale].
     """
 
     if min_scale <= 0 or max_scale <= 0:
         raise ValueError("scales must be positive")
     if max_scale < min_scale:
         raise ValueError("max_scale must be >= min_scale")
+    if eps <= 0:
+        raise ValueError("eps must be > 0")
 
     scales = torch.zeros_like(importance)
     selected = mask > 0
     if selected.sum().item() == 0:
         return scales
 
-    imp = importance[selected]
-    imp_min = imp.min()
-    imp_max = imp.max()
-    if imp_max > imp_min:
-        imp_norm = (imp - imp_min) / (imp_max - imp_min)
-    else:
-        imp_norm = torch.ones_like(imp)
+    imp = torch.nan_to_num(
+        importance[selected].abs(),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
 
-    # High importance -> smaller noise scale.
-    rel = max_scale - imp_norm * (max_scale - min_scale)
-    scales[selected] = rel
-    return scales
+    if mode == "linear":
+        imp_min = imp.min()
+        imp_max = imp.max()
+        if imp_max > imp_min:
+            imp_norm = (imp - imp_min) / (imp_max - imp_min)
+        else:
+            imp_norm = torch.ones_like(imp)
+
+        # High importance -> smaller noise scale.
+        rel = max_scale - imp_norm * (max_scale - min_scale)
+        scales[selected] = rel
+        return scales
+
+    if mode == "inverse_power":
+        if alpha <= 0:
+            raise ValueError("alpha must be > 0 for inverse_power")
+
+        # Variance weights follow inverse importance; std uses sqrt(weights).
+        inv = imp.clamp_min(eps).pow(-alpha)
+        total = inv.sum()
+        if total <= 0:
+            rel = torch.ones_like(inv)
+        else:
+            weights = inv / total
+            rel = torch.sqrt(weights * float(weights.numel()))
+
+        rel = rel.clamp(min=min_scale, max=max_scale)
+        scales[selected] = rel
+        return scales
+
+    raise ValueError(f"Unknown relative scale mode: {mode}")
 
 
 def normalize_relative_scales(

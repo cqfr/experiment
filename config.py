@@ -117,7 +117,7 @@ class ServerConfig:
 
     initial_clip: float = 1.0
     clip_update_method: ClipUpdateMethod = ClipUpdateMethod.ADAPTIVE
-    target_quantile: float = 0.5
+    target_quantile: float = 0.9
     clip_lr: float = 0.2
     ema_alpha: float = 0.8
 
@@ -137,6 +137,12 @@ class DPConfig:
     use_heterogeneous_noise: bool = True
     min_relative_noise: float = 0.3
     max_relative_noise: float = 3.0
+    relative_noise_mode: Literal["inverse_power", "linear"] = "inverse_power"
+    relative_noise_alpha: float = 1.0
+    relative_noise_eps: float = 1e-6
+    # Conservative RDP correction for heterogeneous per-parameter scales:
+    # z_eff = (min_relative_noise / max_relative_noise) * z_base.
+    account_for_relative_noise_in_rdp: bool = True
 
     # RDP accountant settings.
     rdp_orders: tuple[float, ...] = (
