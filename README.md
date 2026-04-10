@@ -614,10 +614,3 @@ python visualize.py --history ./logs/xxx/history.json --output_dir ./figures --p
 - 可视化相关：
   - `--importance_viz --importance_viz_interval --importance_viz_client --importance_viz_max_elements`
 
----
-
-## 8. 备注
-
-- 当前仓库中的部分中文注释存在编码混杂（显示可能乱码），不影响 Python 代码执行。
-- `run_hyperparam.py`、`visualize.py` 可正常作为 CLI 工具使用，建议后续统一文件编码为 UTF-8。
-- 如果要做论文复现实验，建议先用 `quick_test.py` 验证链路，再跑 `dp_fedavg`，最后跑 `proposed` 与消融。
