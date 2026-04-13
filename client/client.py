@@ -18,11 +18,6 @@ from compression.topk import (
     compute_importance_grad_normalized,
     compress_gradient,
 )
-from dp.noise import (
-    add_heterogeneous_noise,
-    add_noise_to_tensor,
-    allocate_relative_scales,
-)
 
 
 @dataclass
@@ -33,14 +28,15 @@ class ClientUpdate:
     data_size: int
     stat: float
     clipped: bool
-    noise_sigma: float = 0.0
     upload_ratio: float = 1.0
+    importance_dict: Optional[Dict[str, torch.Tensor]] = None
+    mask_dict: Optional[Dict[str, torch.Tensor]] = None
     importance_vector: Optional[torch.Tensor] = None
     mask_vector: Optional[torch.Tensor] = None
 
 
 class FLClient:
-    """Client worker for local training, compression, clipping, and DP noise."""
+    """Client worker for local training, compression, and clipping."""
 
     def __init__(
         self,
@@ -52,7 +48,7 @@ class FLClient:
         device: torch.device,
     ) -> None:
         self.client_id = client_id
-        self.model = copy.deepcopy(model).to(device)
+        self.model = copy.deepcopy(model).cpu()
         self.dataloader = dataloader
         self.config = config
         self.dp_config = dp_config
@@ -65,8 +61,6 @@ class FLClient:
         self.global_weights: Optional[Dict[str, torch.Tensor]] = None
         self.fisher_cache: Optional[Dict[str, torch.Tensor]] = None
 
-        self.rng = torch.Generator(device="cpu")
-
     def receive_global_model(self, global_weights: Dict[str, torch.Tensor]) -> None:
         self.model.load_state_dict(global_weights)
         self.global_weights = {k: v.clone() for k, v in global_weights.items()}
@@ -74,7 +68,7 @@ class FLClient:
     def local_train(self) -> Dict[str, torch.Tensor]:
         """Run local optimization and return model delta: Delta_w = w_local - w_global."""
 
-        self.model.train() #训练模式
+        self.model.train()
         optimizer = optim.SGD(
             self.model.parameters(),
             lr=self.config.lr,
@@ -102,7 +96,7 @@ class FLClient:
         for _ in range(self.config.local_epochs):
             for data, target in self.dataloader:
                 data, target = data.to(self.device), target.to(self.device)
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 logits = self.model(data)
                 loss = criterion(logits, target)
 
@@ -123,7 +117,7 @@ class FLClient:
                 data, target = data.to(self.device), target.to(self.device)
 
                 # First step: gradient at current weights.
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 loss = criterion(self.model(data), target)
                 loss.backward()
 
@@ -141,7 +135,7 @@ class FLClient:
                         perturbations.append(e_w)
 
                 # Second step: gradient at perturbed weights.
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 loss_perturbed = criterion(self.model(data), target)
                 loss_perturbed.backward()
 
@@ -228,7 +222,7 @@ class FLClient:
             topk_strategy=self.config.topk_strategy.value,
             k_ratio=self.config.topk_ratio,
             weight_method=self.config.layer_weight_method.value,
-            fisher=self.fisher_cache,#fisher_cashe如果没有的话，有时候会报错
+            fisher=self.fisher_cache,
             importance=importance,
         )
 
@@ -240,7 +234,6 @@ class FLClient:
         upload_ratio = float(kept_params / total_params) if total_params > 0 else 1.0
         return sparse_delta, masks, upload_ratio
 
-# 真不会超过这个阈值吗？
     def clip_delta(
         self,
         delta_w: Dict[str, torch.Tensor],
@@ -258,131 +251,84 @@ class FLClient:
 
         return clipped_delta, total_norm, clipped
 
-    def add_dp_noise(
-        self,
-        delta_w: Dict[str, torch.Tensor],
-        masks: Dict[str, torch.Tensor],
-        importance: Dict[str, torch.Tensor],
-        sigma_base: float,
-    ) -> Tuple[Dict[str, torch.Tensor], float]:
-        if not self.dp_config.enabled or sigma_base <= 0:
-            return delta_w, 0.0
-
-        if not self.dp_config.use_heterogeneous_noise:
-            noisy = {
-                name: add_noise_to_tensor(d, sigma_base, generator=self.rng)
-                for name, d in delta_w.items()
-            }
-            return noisy, sigma_base
-
-        return self._add_heterogeneous_noise(delta_w, masks, importance, sigma_base)
-
-    def _add_heterogeneous_noise(
-        self,
-        delta_w: Dict[str, torch.Tensor],
-        masks: Dict[str, torch.Tensor],
-        importance: Dict[str, torch.Tensor],
-        sigma_base: float,
-    ) -> Tuple[Dict[str, torch.Tensor], float]:
-        flat_delta = []
-        flat_mask = []
-        flat_importance = []
-        slices = []
-
-        offset = 0
-        for name, d in delta_w.items():
-            d_flat = d.flatten()
-            m_flat = masks.get(name, torch.ones_like(d)).flatten()
-            i_flat = importance.get(name, d.abs()).flatten()
-
-            flat_delta.append(d_flat)
-            flat_mask.append(m_flat)
-            flat_importance.append(i_flat)
-            slices.append((name, offset, offset + d_flat.numel(), d.shape))
-            offset += d_flat.numel()
-
-        if not flat_delta:
-            return delta_w, 0.0
-
-        global_delta = torch.cat(flat_delta)
-        global_mask = torch.cat(flat_mask)
-        global_importance = torch.cat(flat_importance)
-
-        rel_scales = allocate_relative_scales(
-            importance=global_importance,
-            mask=global_mask,
-            min_scale=self.dp_config.min_relative_noise,
-            max_scale=self.dp_config.max_relative_noise,
-            mode=self.dp_config.relative_noise_mode,
-            alpha=self.dp_config.relative_noise_alpha,
-            eps=self.dp_config.relative_noise_eps,
-        )
-
-        noisy_global, avg_sigma = add_heterogeneous_noise(
-            tensor=global_delta,
-            sigma_base=sigma_base,
-            relative_scales=rel_scales,
-            mask=global_mask,
-            generator=self.rng,
-        )
-
-        noisy_delta: Dict[str, torch.Tensor] = {}
-        for name, start, end, shape in slices:
-            noisy_delta[name] = noisy_global[start:end].reshape(shape)
-
-        return noisy_delta, avg_sigma
-
     def train_and_upload(
         self,
         global_weights: Dict[str, torch.Tensor],
         clip_norm: float,
-        sigma_base: float,
         return_importance_snapshot: bool = False,
         importance_max_elements: int = 4096,
     ) -> ClientUpdate:
-        self.receive_global_model(global_weights)
+        self.model = self.model.to(self.device)
+        if self.old_local_weights is not None:
+            self.old_local_weights = {k: v.to(self.device) for k, v in self.old_local_weights.items()}
+        if self.residual_accumulator.residual:
+            self.residual_accumulator.residual = {
+                k: v.to(self.device) for k, v in self.residual_accumulator.residual.items()
+            }
+        if self.fisher_cache is not None:
+            self.fisher_cache = {k: v.to(self.device) for k, v in self.fisher_cache.items()}
 
-        delta_w = self.local_train()
-        delta_w = self.accumulate_residual(delta_w)
+        try:
+            self.receive_global_model(global_weights)
 
-        importance = self.compute_importance(delta_w)
-        sparse_delta, masks, upload_ratio = self.topk_compress(delta_w, importance)
+            delta_w = self.local_train()
+            delta_w = self.accumulate_residual(delta_w)
 
-        clipped_delta, l2_norm, clipped = self.clip_delta(sparse_delta, clip_norm)
+            importance = self.compute_importance(delta_w)
+            sparse_delta, masks, upload_ratio = self.topk_compress(delta_w, importance)
 
-        noisy_delta, noise_sigma = self.add_dp_noise(
-            clipped_delta,
-            masks,
-            importance,
-            sigma_base,
-        )
-#这里是关于梯度裁剪的返回值，默认是l2范数，也可以直接返回二值统计量
-        stat = 1.0 if clipped else 0.0
-        if self.config.stat_type.value == "l2_norm":
-            stat = l2_norm
+            clipped_delta, l2_norm, clipped = self.clip_delta(sparse_delta, clip_norm)
+            stat = 1.0 if clipped else 0.0
+            if self.config.stat_type.value == "l2_norm":
+                stat = l2_norm
 
-        importance_vector = None
-        mask_vector = None
-        if return_importance_snapshot:
-            importance_vector = self._build_vector_snapshot(
-                tensors=importance,
-                max_elements=importance_max_elements,
+            importance_vector = None
+            mask_vector = None
+            if return_importance_snapshot:
+                importance_vector = self._build_vector_snapshot(
+                    tensors=importance,
+                    max_elements=importance_max_elements,
+                )
+                mask_vector = self._build_vector_snapshot(
+                    tensors=masks,
+                    max_elements=importance_max_elements,
+                )
+
+            upload_delta = {name: d.detach().cpu() for name, d in clipped_delta.items()}
+            upload_importance = {name: imp.detach().cpu() for name, imp in importance.items()}
+            upload_masks = {name: m.detach().cpu() for name, m in masks.items()}
+
+            return ClientUpdate(
+                delta_w=upload_delta,
+                data_size=self.data_size,
+                stat=stat,
+                clipped=clipped,
+                upload_ratio=upload_ratio,
+                importance_dict=upload_importance,
+                mask_dict=upload_masks,
+                importance_vector=importance_vector,
+                mask_vector=mask_vector,
             )
-            mask_vector = self._build_vector_snapshot(
-                tensors=masks,
-                max_elements=importance_max_elements,
-            )
-
-        return ClientUpdate(
-            delta_w=noisy_delta,
-            data_size=self.data_size,
-            stat=stat,
-            clipped=clipped,
-            noise_sigma=noise_sigma,
-            upload_ratio=upload_ratio,
-            importance_vector=importance_vector,
-            mask_vector=mask_vector,
-        )
+        finally:
+            self.model = self.model.cpu()
+            if self.old_local_weights is not None:
+                self.old_local_weights = {
+                    k: v.detach().cpu()
+                    for k, v in self.old_local_weights.items()
+                }
+            if self.residual_accumulator.residual:
+                self.residual_accumulator.residual = {
+                    k: v.detach().cpu()
+                    for k, v in self.residual_accumulator.residual.items()
+                }
+            if self.fisher_cache is not None:
+                self.fisher_cache = {
+                    k: v.detach().cpu()
+                    for k, v in self.fisher_cache.items()
+                }
+            self.global_weights = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     @staticmethod
     def _build_vector_snapshot(

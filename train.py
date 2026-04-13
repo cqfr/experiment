@@ -25,7 +25,6 @@ from config import (
 from data.utils import get_dataloader
 from dp.noise import (
     RDPAccountant,
-    allocate_client_noise_stds,
     compute_weighted_sensitivity,
 )
 from models.resnet import ResNet18
@@ -119,7 +118,6 @@ class FLTrainer:
                 1.0 / max(1, len(selected_ids)) for _ in selected_ids
             ]
 
-        sigma_by_client = [0.0 for _ in selected_ids]
         sigma_agg = 0.0
         sensitivity_l2 = 0.0
         noise_multiplier = 0.0
@@ -147,30 +145,17 @@ class FLTrainer:
                 clip_norm=clip_norm,
             )
             sigma_agg = noise_multiplier_base * sensitivity_l2
-            client_importance = None
-            if self.config.dp.client_noise_allocation == "heterogeneous":
-                client_importance = [float(s) for s in selected_sizes]
-            sigma_by_client = allocate_client_noise_stds(
-                client_weights=client_weights,
-                sigma_agg=sigma_agg,
-                strategy=self.config.dp.client_noise_allocation,
-                client_importance=client_importance,
-                max_sigma_scale=self.config.dp.client_variance_max_scale,
-            )
         else:
             sigma_agg = 0.0
         global_weights = self.server.get_global_weights()
 
-        client_deltas: List[Dict[str, torch.Tensor]] = []
-        data_sizes: List[int] = []
-        stats: List[float] = []
-        noise_sigmas: List[float] = []
+        client_updates = []
         upload_ratios: List[float] = []
         viz_client_id: Optional[int] = None
         viz_importance: Optional[torch.Tensor] = None
         viz_mask: Optional[torch.Tensor] = None
 
-        for local_idx, client_id in enumerate(selected_ids):
+        for client_id in selected_ids:
             client = self.clients[client_id]
             need_viz = (
                 self.config.importance_viz_enabled
@@ -180,14 +165,10 @@ class FLTrainer:
             update = client.train_and_upload(
                 global_weights=global_weights,
                 clip_norm=clip_norm,
-                sigma_base=sigma_by_client[local_idx],
                 return_importance_snapshot=need_viz,
                 importance_max_elements=self.config.importance_viz_max_elements,
             )
-            client_deltas.append(update.delta_w)
-            data_sizes.append(update.data_size)
-            stats.append(update.stat)
-            noise_sigmas.append(update.noise_sigma)
+            client_updates.append(update)
             upload_ratios.append(update.upload_ratio)
             if need_viz and update.importance_vector is not None:
                 viz_client_id = client_id
@@ -195,9 +176,9 @@ class FLTrainer:
                 viz_mask = update.mask_vector
 
         aggregated = self.server.aggregate(
-            client_updates=client_deltas,
-            data_sizes=data_sizes,
-            stats=stats,
+            client_updates=client_updates,
+            sigma_agg=sigma_agg,
+            dp_config=self.config.dp,
             stats_agg_method=self.config.edge.stats_agg_method,
         )
 
@@ -206,9 +187,7 @@ class FLTrainer:
             stats_aggregated=aggregated.stats_aggregated,
         )
 
-        train_metrics["avg_noise_sigma"] = (
-            float(np.mean(noise_sigmas)) if noise_sigmas else 0.0
-        )
+        train_metrics["avg_noise_sigma"] = float(sigma_agg)
         train_metrics["avg_upload_ratio"] = (
             float(np.mean(upload_ratios)) if upload_ratios else 1.0
         )
@@ -216,7 +195,7 @@ class FLTrainer:
         train_metrics["noise_multiplier_base"] = float(noise_multiplier_base)
         train_metrics["relative_noise_rdp_factor"] = float(relative_noise_rdp_factor)
         train_metrics["sigma_agg"] = float(sigma_agg)
-        train_metrics["sigma_base"] = float(np.mean(sigma_by_client)) if sigma_by_client else 0.0
+        train_metrics["sigma_base"] = float(sigma_agg)
         train_metrics["sensitivity_l2"] = float(sensitivity_l2)
         if viz_importance is not None and viz_client_id is not None:
             self._save_importance_visualization(
@@ -586,7 +565,7 @@ def main() -> None:
     config.dp.client_variance_max_scale = args.client_variance_max_scale
     config.dp.account_for_topk_in_q = args.account_for_topk_in_q
 
-    if args.experiment in {"proposed", "dp_fedavg", "dp_fedsam"}:
+    if args.experiment == "proposed":
         config.client.topk_ratio = args.topk_ratio
 
     results = run_experiment(args.experiment, config)
