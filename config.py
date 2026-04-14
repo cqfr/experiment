@@ -222,7 +222,10 @@ def get_fedavg_config() -> ExperimentConfig:
     return config
 
 
-def get_dp_fedavg_config(epsilon: float = 8.0) -> ExperimentConfig:
+def get_dp_fedavg_config(
+    epsilon: float = 8.0,
+    initial_clip: float = 15.0,
+) -> ExperimentConfig:
     """DP-FedAvg baseline."""
 
     config = ExperimentConfig()
@@ -232,7 +235,10 @@ def get_dp_fedavg_config(epsilon: float = 8.0) -> ExperimentConfig:
     config.dp.enabled = True
     config.dp.epsilon_total = epsilon
     config.dp.use_heterogeneous_noise = False
+    config.dp.client_noise_allocation = "uniform"
+    config.server.initial_clip = initial_clip
     config.server.clip_update_method = ClipUpdateMethod.EMA
+    # alpha=1.0 means no clip update (fixed flat clipping).
     config.server.ema_alpha = 1.0
     return config
 

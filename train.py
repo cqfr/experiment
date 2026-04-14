@@ -85,6 +85,8 @@ class FLTrainer:
             "noise_multiplier_base": [],
             "sigma_agg": [],
             "sigma_base": [],
+            "actual_sigma": [],
+            "snr": [],
         }
 
         os.makedirs(config.save_dir, exist_ok=True)
@@ -147,6 +149,14 @@ class FLTrainer:
             sigma_agg = noise_multiplier_base * sensitivity_l2
         else:
             sigma_agg = 0.0
+
+        actual_sigma = float(sigma_agg)
+        z_base = float(noise_multiplier_base)
+        snr = (
+            float(clip_norm / max(actual_sigma, 1e-12))
+            if self.privacy_accountant is not None
+            else 0.0
+        )
         global_weights = self.server.get_global_weights()
 
         client_updates = []
@@ -197,6 +207,9 @@ class FLTrainer:
         train_metrics["sigma_agg"] = float(sigma_agg)
         train_metrics["sigma_base"] = float(sigma_agg)
         train_metrics["sensitivity_l2"] = float(sensitivity_l2)
+        train_metrics["z"] = z_base
+        train_metrics["actual_sigma"] = actual_sigma
+        train_metrics["snr"] = snr
         if viz_importance is not None and viz_client_id is not None:
             self._save_importance_visualization(
                 round_num=round_num,
@@ -312,6 +325,8 @@ class FLTrainer:
             self.history["noise_multiplier_base"].append(train_metrics.get("noise_multiplier_base", 0.0))
             self.history["sigma_agg"].append(train_metrics.get("sigma_agg", 0.0))
             self.history["sigma_base"].append(train_metrics.get("sigma_base", 0.0))
+            self.history["actual_sigma"].append(train_metrics.get("actual_sigma", 0.0))
+            self.history["snr"].append(train_metrics.get("snr", 0.0))
 
             if self.privacy_accountant is not None:
                 self.history["privacy_spent"].append(train_metrics.get("epsilon_spent", 0.0))
@@ -327,10 +342,9 @@ class FLTrainer:
                 if self.privacy_accountant is not None:
                     msg += (
                         f" | eps={train_metrics.get('epsilon_spent', 0.0):.4f}"
-                        f" | z={train_metrics.get('noise_multiplier', 0.0):.4f}"
-                        f" | z_base={train_metrics.get('noise_multiplier_base', 0.0):.4f}"
-                        f" | sigma_agg={train_metrics.get('sigma_agg', 0.0):.4f}"
-                        f" | sigma_client={train_metrics.get('sigma_base', 0.0):.4f}"
+                        f" | z={train_metrics.get('z', 0.0):.4f}"
+                        f" | actual_sigma={train_metrics.get('actual_sigma', 0.0):.4f}"
+                        f" | SNR={train_metrics.get('snr', 0.0):.4f}"
                     )
                 tqdm.write(msg)
 
@@ -394,6 +408,8 @@ class FLTrainer:
             "noise_multiplier_base": self.history["noise_multiplier_base"],
             "sigma_agg": self.history["sigma_agg"],
             "sigma_base": self.history["sigma_base"],
+            "actual_sigma": self.history["actual_sigma"],
+            "snr": self.history["snr"],
         }
 
         summary = {

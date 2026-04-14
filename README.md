@@ -77,7 +77,8 @@ python quick_test.py
 # FedAvg
 python train.py --experiment fedavg --dataset cifar10 --num_rounds 100
 
-# DP-FedAvg（建议先跑这个）
+# DP-FedAvg（McMahan 2018 对齐：固定裁剪 + 均匀噪声）
+# 默认固定裁剪阈值 initial_clip=15（由预设函数设置）
 python train.py --experiment dp_fedavg --dataset cifar10 --epsilon 8 --num_rounds 100 --client_noise_allocation uniform
 
 # DP-FedSAM
@@ -95,6 +96,9 @@ python train.py --experiment proposed --dataset cifar10 --epsilon 8 --topk_ratio
 ```bash
 # 全部消融 + 基线
 python run_ablation.py --dataset cifar10 --epsilon 8 --num_rounds 100
+
+# DP-FedAvg 公平性 sweep：固定裁剪阈值 S in {1,5,10,15}
+python run_ablation.py --dataset cifar10 --epsilon 8 --num_rounds 100 --dp_fedavg_clips 1 5 10 15
 
 # 快速测试
 python run_ablation.py --quick_test --dataset mnist
@@ -141,12 +145,13 @@ python visualize.py --history ./logs/xxx/history.json --output_dir ./figures --p
 3. 从 `num_clients` 随机采样 `clients_per_round` 个客户端。
 4. 若启用 DP：
    - 用 `RDPAccountant.solve_noise_multiplier_for_round` 反解本轮 `z`。
+   - `z` 的求解基于 RDP 全局组合：先按 `num_rounds * steps` 累加 RDP，再统一转 `(epsilon, delta)`，而不是将 `epsilon_total` 平均拆分到单轮。
    - 用 `compute_weighted_sensitivity` 得到加权聚合敏感度上界。
    - 构造目标聚合标准差 `sigma_agg = z_base * sensitivity`。
    - 用 `allocate_client_noise_stds` 反解每个客户端的 `sigma_base`。
 5. 每个客户端执行 `train_and_upload`：本地训练 -> 残差累积 -> 重要性计算 -> Top-k -> 裁剪 -> 加噪。
 6. 服务端 `aggregate` 做加权聚合，`update_global_model` 更新全局参数并更新裁剪阈值。
-7. 评测测试集，记录 `accuracy/loss/clip/upload/epsilon/z/sigma` 等日志。
+7. 评测测试集，记录 `accuracy/loss/clip/upload/epsilon/z/actual_sigma/SNR` 等日志。
 8. 按需保存 checkpoint、history、experiment_record。
 
 ---
@@ -175,7 +180,7 @@ python visualize.py --history ./logs/xxx/history.json --output_dir ./figures --p
 ### 4.3 预设配置函数
 
 - `get_fedavg_config()`: 纯 FedAvg，无 DP，无压缩残差。
-- `get_dp_fedavg_config(epsilon)`: DP-FedAvg，同方差 DP 噪声。
+- `get_dp_fedavg_config(epsilon, initial_clip=15.0)`: DP-FedAvg 基线（固定平坦裁剪 + 同方差均匀高斯噪声）。
 - `get_dp_fedsam_config(epsilon)`: DP-FedSAM，在 DP-FedAvg 上替换本地优化为 SAM 两步。
 - `get_proposed_config(epsilon)`: Proposed 全模块默认开启。
 
@@ -227,7 +232,8 @@ python visualize.py --history ./logs/xxx/history.json --output_dir ./figures --p
 - `FLTrainer._select_clients(count)`
   - 每轮随机采样客户端 ID。
 - `FLTrainer.train_round(round_num)`
-  - 单轮核心逻辑：噪声标定、客户端训练上传、服务端聚合更新、可视化快照、隐私预算累积。
+  - 单轮核心逻辑：基于全局 RDP 组合的噪声标定、客户端训练上传、服务端聚合更新、可视化快照、隐私预算累积。
+  - 训练指标中显式记录：`z`（无量纲噪声乘子）、`actual_sigma`（真实绝对噪声强度）、`snr`。
 - `FLTrainer._save_importance_visualization(...)`
   - 将某客户端的重要性/掩码向量保存为 `.npz` 与热图 `.png`。
 - `FLTrainer.evaluate()`
@@ -237,7 +243,7 @@ python visualize.py --history ./logs/xxx/history.json --output_dir ./figures --p
 - `FLTrainer._save_checkpoint(round_num, is_best, is_final)`
   - 保存模型参数、轮次、裁剪阈值、配置快照。
 - `FLTrainer._save_history()`
-  - 写出 `history.json`、`experiment_record.json`、`config_summary.txt`。
+  - 写出 `history.json`、`experiment_record.json`、`config_summary.txt`，其中 `history.json` 包含 `actual_sigma/snr` 独立曲线。
 - `FLTrainer._config_to_dict(config)`
   - dataclass + 枚举转可序列化字典。
 - `run_experiment(experiment_name, config)`
@@ -255,16 +261,17 @@ python visualize.py --history ./logs/xxx/history.json --output_dir ./figures --p
 
 - `_base_overrides(config, num_rounds, dataset)`
   - 给任意配置打上统一实验底座（客户端数、采样数、alpha 等）。
-- `get_ablation_set(epsilon, num_rounds, dataset)`
+- `get_ablation_set(epsilon, num_rounds, dataset, dp_fedavg_initial_clips)`
   - 构造实验集合：
-  - 基线：`fedavg / dp_fedavg / dp_fedsam / proposed_full`
+  - 基线：`fedavg / dp_fedavg / dp_fedavg_clip_* / dp_fedsam / proposed_full`
   - 消融：`ablation_no_compression / ablation_no_adaptive_clip / ablation_no_hetero_noise / ablation_no_contrastive`
 - `run_one(name, config)`
   - 跑单个实验并返回摘要。
 - `run_ablation_study(...)`
   - 批量执行并保存总表 `ablation_summary_*.json`。
+  - 对 `dp_fedavg` 固定裁剪阈值集合（默认 `{1,5,10,15}`）做公平性 sweep，并在汇总中给出最佳 DP-FedAvg clip 结果。
 - `parse_args()`
-  - 命令行参数解析。
+  - 命令行参数解析（含 `--dp_fedavg_clips`）。
 - `main()`
   - 入口函数（支持 `--quick_test`）。
 
@@ -547,7 +554,7 @@ python visualize.py --history ./logs/xxx/history.json --output_dir ./figures --p
 - `_epsilon_from_rdp(rdp_values, delta)`
   - 从多阶 RDP 转换 `(epsilon, delta)`。
 - `RDPAccountant.__post_init__()`
-  - 初始化每轮目标与累计 RDP 容器。
+  - 初始化累计 RDP 容器（不再按轮平均拆分 `epsilon_total`）。
 - `RDPAccountant.current_epsilon()`
   - 当前累计隐私开销。
 - `RDPAccountant.remaining_budget()`
@@ -555,7 +562,8 @@ python visualize.py --history ./logs/xxx/history.json --output_dir ./figures --p
 - `RDPAccountant.is_exhausted()`
   - 是否耗尽预算。
 - `RDPAccountant.solve_noise_multiplier_for_round(...)`
-  - 二分反解本轮满足目标 epsilon 的 `z`。
+  - 二分反解 `z`，目标为全局预算 `epsilon_total`。
+  - 内部按 `total_rdp(alpha) = num_rounds * steps * rdp_one_step(alpha, z)` 组合后再统一转换 epsilon。
 - `RDPAccountant.solve_sigma_for_round(...)`
   - 兼容别名（返回同一含义）。
 - `RDPAccountant.consume_round(noise_multiplier, q, steps, sigma)`
@@ -588,7 +596,7 @@ python visualize.py --history ./logs/xxx/history.json --output_dir ./figures --p
 关键文件：
 
 - `history.json`
-  - 轮次级曲线数据：`test_accuracy/test_loss/clip_history/privacy_spent/upload_ratio/noise_multiplier/sigma_agg...`
+  - 轮次级曲线数据：`test_accuracy/test_loss/clip_history/privacy_spent/upload_ratio/noise_multiplier/actual_sigma/snr/sigma_agg...`
 - `experiment_record.json`
   - 完整记录：`experiment_info + config + summary + history`
 - `config_summary.txt`
@@ -604,6 +612,8 @@ python visualize.py --history ./logs/xxx/history.json --output_dir ./figures --p
   - `--experiment`: `fedavg | dp_fedavg | dp_fedsam | proposed`
   - `--dataset`: `cifar10 | mnist`
   - `--num_rounds --num_clients --clients_per_round --alpha --iid --seed`
+- 消融脚本参数：
+  - `run_ablation.py --dp_fedavg_clips 1 5 10 15`（固定裁剪基线公平性 sweep）
 - DP 相关：
   - `--epsilon`
   - `--client_noise_allocation`: `uniform | heterogeneous`
@@ -613,4 +623,3 @@ python visualize.py --history ./logs/xxx/history.json --output_dir ./figures --p
   - `--topk_ratio`
 - 可视化相关：
   - `--importance_viz --importance_viz_interval --importance_viz_client --importance_viz_max_elements`
-

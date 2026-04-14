@@ -58,7 +58,6 @@ class RDPAccountant:
         if not self.orders:
             raise ValueError("orders must not be empty")
 
-        self.epsilon_round_target = self.epsilon_total / float(self.num_rounds)
         self._rdp_cumulative = {order: 0.0 for order in self.orders}
         self.round_count = 0
 
@@ -81,23 +80,26 @@ class RDPAccountant:
         self,
         q: float,
         steps: int = 1,
-        epsilon_target: Optional[float] = None,
         z_lo: float = 1e-3,
         z_hi: float = 1e3,
         tol: float = 1e-6,
         max_iter: int = 200,
     ) -> float:
-        """Binary-search noise multiplier z for one-round epsilon target."""
+        """Binary-search noise multiplier z against global epsilon budget.
+
+        We calibrate z using full-horizon composition:
+            RDP_total(alpha) = num_rounds * steps * RDP_one_step(alpha, z)
+        then convert once to (epsilon, delta)-DP.
+        """
 
         if steps <= 0:
             raise ValueError("steps must be > 0")
-        target = self.epsilon_round_target if epsilon_target is None else epsilon_target
-        if target <= 0:
-            raise ValueError("epsilon target must be > 0")
+        target = self.epsilon_total
 
-        def round_eps(z: float) -> float:
-            one_round_rdp = {
-                alpha: steps
+        def total_eps(z: float) -> float:
+            total_rdp = {
+                alpha: self.num_rounds
+                * steps
                 * _rdp_subsampled_gaussian(
                     q=q,
                     noise_multiplier=z,
@@ -105,15 +107,15 @@ class RDPAccountant:
                 )
                 for alpha in self.orders
             }
-            return _epsilon_from_rdp(one_round_rdp, self.delta)
+            return _epsilon_from_rdp(total_rdp, self.delta)
 
         # Ensure upper bound is feasible.
-        while round_eps(z_hi) > target and z_hi < 1e7:
+        while total_eps(z_hi) > target and z_hi < 1e7:
             z_hi *= 2.0
 
         for _ in range(max_iter):
             mid = 0.5 * (z_lo + z_hi)
-            eps_mid = round_eps(mid)
+            eps_mid = total_eps(mid)
             if abs(eps_mid - target) <= tol:
                 return mid
             if eps_mid > target:
