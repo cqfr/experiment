@@ -173,8 +173,16 @@ class FLServer:
         if not client_updates:
             return {}
 
-        total_data = max(1, sum(data_sizes))
-        weights = [size / total_data for size in data_sizes]
+        if self.config.aggregation_weight_strategy == "equal":
+            uniform_weight = 1.0 / max(1, len(client_updates))
+            weights = [uniform_weight for _ in client_updates]
+        else:
+            total_data = sum(data_sizes)
+            if total_data > 0:
+                weights = [size / total_data for size in data_sizes]
+            else:
+                uniform_weight = 1.0 / max(1, len(client_updates))
+                weights = [uniform_weight for _ in client_updates]
 
         global_update: Dict[str, torch.Tensor] = {}
         for name in client_updates[0].keys():

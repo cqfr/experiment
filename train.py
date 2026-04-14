@@ -112,13 +112,18 @@ class FLTrainer:
 
         selected_ids = self._select_clients(self.config.clients_per_round)
         selected_sizes = [self.clients[idx].data_size for idx in selected_ids]
-        total_selected = sum(selected_sizes)
-        if total_selected > 0:
-            client_weights = [size / total_selected for size in selected_sizes]
-        else:
+        if self.config.server.aggregation_weight_strategy == "equal":
             client_weights = [
                 1.0 / max(1, len(selected_ids)) for _ in selected_ids
             ]
+        else:
+            total_selected = sum(selected_sizes)
+            if total_selected > 0:
+                client_weights = [size / total_selected for size in selected_sizes]
+            else:
+                client_weights = [
+                    1.0 / max(1, len(selected_ids)) for _ in selected_ids
+                ]
 
         sigma_agg = 0.0
         sensitivity_l2 = 0.0
@@ -478,6 +483,7 @@ class FLTrainer:
             },
             "server": {
                 "server_lr": config.server.server_lr,
+                "aggregation_weight_strategy": config.server.aggregation_weight_strategy,
                 "initial_clip": config.server.initial_clip,
                 "clip_update_method": config.server.clip_update_method.value,
                 "target_quantile": config.server.target_quantile,
@@ -551,6 +557,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--client_variance_max_scale", type=float, default=10.0)
     parser.add_argument("--account_for_topk_in_q", action="store_true")
+    parser.add_argument(
+        "--aggregation_weight_strategy",
+        type=str,
+        choices=["data_size", "equal"],
+        default="data_size",
+    )
     return parser.parse_args()
 
 
@@ -580,6 +592,7 @@ def main() -> None:
     config.dp.client_noise_allocation = args.client_noise_allocation
     config.dp.client_variance_max_scale = args.client_variance_max_scale
     config.dp.account_for_topk_in_q = args.account_for_topk_in_q
+    config.server.aggregation_weight_strategy = args.aggregation_weight_strategy
 
     if args.experiment == "proposed":
         config.client.topk_ratio = args.topk_ratio

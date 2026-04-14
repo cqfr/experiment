@@ -114,6 +114,7 @@ class ServerConfig:
     """Server-side optimization and clipping controls."""
 
     server_lr: float = 1.0
+    aggregation_weight_strategy: Literal["data_size", "equal"] = "data_size"
 
     initial_clip: float = 1.0
     clip_update_method: ClipUpdateMethod = ClipUpdateMethod.ADAPTIVE
