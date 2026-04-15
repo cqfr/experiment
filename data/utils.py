@@ -13,12 +13,14 @@ DatasetName = Literal["cifar10", "mnist"]
 
 
 def get_dataloader(
-    num_clients: int = 10,
+    num_clients: int = 500,
     batch_size: int = 32,
     alpha: float = 0.5,
     iid: bool = False,
     dataset: DatasetName = "cifar10",
     data_dir: str | None = None,
+    min_samples_per_client: int = 1,
+    split_max_attempts: int = 50,
 ) -> Tuple[List[DataLoader], DataLoader]:
     """Load dataset and split train data into client dataloaders."""
 
@@ -34,10 +36,21 @@ def get_dataloader(
     if iid:
         client_indices = _split_iid(train_dataset, num_clients)
     else:
-        client_indices = _split_noniid_dirichlet(train_dataset, num_clients, alpha)
+        client_indices = _split_noniid_dirichlet(
+            train_dataset,
+            num_clients,
+            alpha,
+            min_samples_per_client=min_samples_per_client,
+            max_attempts=split_max_attempts,
+        )
 
     train_loaders = [
-        DataLoader(Subset(train_dataset, indices), batch_size=batch_size, shuffle=True)
+        DataLoader(
+            Subset(train_dataset, indices),
+            batch_size=batch_size,
+            shuffle=True,
+            pin_memory=False,
+        )
         for indices in client_indices
     ]
     test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
@@ -104,31 +117,48 @@ def _split_iid(dataset, num_clients: int) -> List[List[int]]:
     return [indices[i::num_clients].tolist() for i in range(num_clients)]
 
 
-def _split_noniid_dirichlet(dataset, num_clients: int, alpha: float) -> List[List[int]]:
+def _split_noniid_dirichlet(
+    dataset,
+    num_clients: int,
+    alpha: float,
+    min_samples_per_client: int = 1,
+    max_attempts: int = 50,
+) -> List[List[int]]:
     if alpha <= 0:
         raise ValueError("alpha must be > 0")
 
     targets = _extract_targets(dataset)
     num_classes = len(np.unique(targets))
-    client_indices: List[List[int]] = [[] for _ in range(num_clients)]
+    if min_samples_per_client < 1:
+        raise ValueError("min_samples_per_client must be >= 1")
+    if len(dataset) < num_clients * min_samples_per_client:
+        raise ValueError("dataset is too small for the requested min_samples_per_client")
 
-    for cls in range(num_classes):
-        cls_idx = np.where(targets == cls)[0]
-        np.random.shuffle(cls_idx)
+    for _ in range(max_attempts):
+        client_indices: List[List[int]] = [[] for _ in range(num_clients)]
 
-        proportions = np.random.dirichlet(alpha=np.repeat(alpha, num_clients))
-        splits = (proportions * len(cls_idx)).astype(int)
-        splits[-1] = len(cls_idx) - splits[:-1].sum()
+        for cls in range(num_classes):
+            cls_idx = np.where(targets == cls)[0]
+            np.random.shuffle(cls_idx)
 
-        start = 0
-        for client_id, count in enumerate(splits):
-            client_indices[client_id].extend(cls_idx[start : start + count].tolist())
-            start += count
+            proportions = np.random.dirichlet(alpha=np.repeat(alpha, num_clients))
+            splits = (proportions * len(cls_idx)).astype(int)
+            splits[-1] = len(cls_idx) - splits[:-1].sum()
 
-    for indices in client_indices:
-        np.random.shuffle(indices)
+            start = 0
+            for client_id, count in enumerate(splits):
+                client_indices[client_id].extend(cls_idx[start : start + count].tolist())
+                start += count
 
-    return client_indices
+        if min(len(indices) for indices in client_indices) >= min_samples_per_client:
+            for indices in client_indices:
+                np.random.shuffle(indices)
+            return client_indices
+
+    raise RuntimeError(
+        "Failed to produce a non-IID split satisfying min_samples_per_client; "
+        "try reducing min_samples_per_client or increasing split_max_attempts."
+    )
 
 
 def _extract_targets(dataset) -> np.ndarray:

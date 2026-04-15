@@ -1,96 +1,100 @@
 ﻿from __future__ import annotations
 
-"""Main federated training entry."""
+"""Main federated training entry with OmegaConf and threaded client execution."""
 
-import argparse
 import json
 import math
 import os
 import random
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
 import torch
+from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 from client.client import FLClient
-from config import (
-    ExperimentConfig,
-    get_dp_fedavg_config,
-    get_dp_fedsam_config,
-    get_fedavg_config,
-    get_proposed_config,
-)
+from components.strategies import PrivacyEngine
 from data.utils import get_dataloader
-from dp.noise import (
-    RDPAccountant,
-    compute_weighted_sensitivity,
-)
-from models.resnet import ResNet18
+from models import ResNet18, SimpleCNN
 from server.server import FLServer
+
+
+@dataclass
+class ExperimentState:
+    rounds: List[int] = field(default_factory=list)
+    train_metrics: List[Dict[str, float]] = field(default_factory=list)
+    test_metrics: List[Dict[str, float]] = field(default_factory=list)
+    clip_history: List[float] = field(default_factory=list)
+    privacy_spent: List[float] = field(default_factory=list)
+    upload_ratio: List[float] = field(default_factory=list)
+    noise_multiplier: List[float] = field(default_factory=list)
+    sigma_agg: List[float] = field(default_factory=list)
+    clip_snr_proxy: List[float] = field(default_factory=list)
+    signal_l2_norm: List[float] = field(default_factory=list)
+    expected_noise_l2_norm: List[float] = field(default_factory=list)
+    snr_signal_to_noise: List[float] = field(default_factory=list)
 
 
 class FLTrainer:
     """Orchestrates client sampling, local updates, aggregation, and evaluation."""
 
-    def __init__(self, config: ExperimentConfig):
-        self.config = config
-        self._set_seed(config.seed)
+    def __init__(self, cfg: DictConfig):
+        self.cfg = cfg
+        self._set_seed(int(cfg.seed))
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = self._resolve_device()
         print(f"Device: {self.device}")
 
         self.train_loaders, self.test_loader = get_dataloader(
-            num_clients=config.num_clients,
-            batch_size=config.batch_size,
-            alpha=config.alpha,
-            iid=config.iid,
-            dataset=config.dataset,
+            num_clients=int(cfg.data.num_clients),
+            batch_size=int(cfg.data.batch_size),
+            alpha=float(cfg.data.alpha),
+            iid=bool(cfg.data.iid),
+            dataset=str(cfg.data.dataset),
+            data_dir=cfg.data.data_dir,
+            min_samples_per_client=int(cfg.data.min_samples_per_client),
+            split_max_attempts=int(cfg.data.split_max_attempts),
         )
 
-        self.model = ResNet18(num_classes=config.num_classes).to(self.device)
-        self.server = FLServer(model=self.model, config=config.server, device=self.device)
+        self.model = self._build_model().cpu()
+        self.server = FLServer(model=self.model, cfg=cfg, device=self.device)
+        self.privacy_engine = PrivacyEngine(cfg.dp, num_rounds=int(cfg.trainer.num_rounds))
 
         self.clients: List[FLClient] = [
             FLClient(
                 client_id=i,
-                model=self.model,
+                model=self._build_model(),
                 dataloader=self.train_loaders[i],
-                config=config.client,
-                dp_config=config.dp,
+                cfg=cfg,
                 device=self.device,
             )
-            for i in range(config.num_clients)
+            for i in range(int(cfg.data.num_clients))
         ]
 
-        if config.dp.enabled:
-            self.privacy_accountant = RDPAccountant(
-                epsilon_total=config.dp.epsilon_total,
-                delta=config.dp.delta,
-                num_rounds=config.num_rounds,
-                orders=config.dp.rdp_orders,
-            )
-        else:
-            self.privacy_accountant = None
+        self.history = ExperimentState()
+        os.makedirs(str(cfg.trainer.save_dir), exist_ok=True)
+        os.makedirs(str(cfg.trainer.log_dir), exist_ok=True)
 
-        self.history = {
-            "rounds": [],
-            "train_metrics": [],
-            "test_metrics": [],
-            "clip_history": [],
-            "privacy_spent": [],
-            "upload_ratio": [],
-            "noise_multiplier": [],
-            "noise_multiplier_base": [],
-            "sigma_agg": [],
-            "sigma_base": [],
-            "actual_sigma": [],
-            "snr": [],
-        }
+    def _resolve_device(self) -> torch.device:
+        requested = str(self.cfg.trainer.device)
+        if requested == "auto":
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return torch.device(requested)
 
-        os.makedirs(config.save_dir, exist_ok=True)
-        os.makedirs(config.log_dir, exist_ok=True)
+    def _build_model(self) -> torch.nn.Module:
+        model_name = str(self.cfg.model.name)
+        num_classes = int(self.cfg.model.num_classes)
+        if model_name == "simple_cnn":
+            return SimpleCNN(num_classes=num_classes)
+        if model_name == "resnet18":
+            return ResNet18(num_classes=num_classes)
+        raise ValueError(f"Unsupported model: {model_name}")
 
     @staticmethod
     def _set_seed(seed: int) -> None:
@@ -101,205 +105,132 @@ class FLTrainer:
             torch.cuda.manual_seed_all(seed)
 
     def _select_clients(self, count: int) -> List[int]:
-        return random.sample(range(self.config.num_clients), count)
+        return random.sample(range(int(self.cfg.data.num_clients)), count)
 
     def train_round(self, round_num: int) -> Dict[str, float]:
         clip_norm = self.server.get_clip_norm()
-        sampling_rate = self.config.clients_per_round / self.config.num_clients
-        q_accounting = sampling_rate
-        if self.config.dp.account_for_topk_in_q:
-            q_accounting = sampling_rate * self.config.client.topk_ratio
+        clip_weight_template = None
+        if bool(self.cfg.dp.enabled and self.cfg.dp.use_heterogeneous_noise):
+            clip_weight_template = self.server.get_clip_weight_template()
 
-        selected_ids = self._select_clients(self.config.clients_per_round)
+        selected_ids = self._select_clients(int(self.cfg.data.clients_per_round))
         selected_sizes = [self.clients[idx].data_size for idx in selected_ids]
-        if self.config.server.aggregation_weight_strategy == "equal":
-            client_weights = [
-                1.0 / max(1, len(selected_ids)) for _ in selected_ids
-            ]
-        else:
-            total_selected = sum(selected_sizes)
-            if total_selected > 0:
-                client_weights = [size / total_selected for size in selected_sizes]
-            else:
-                client_weights = [
-                    1.0 / max(1, len(selected_ids)) for _ in selected_ids
-                ]
+        client_weights = self._build_client_weights(selected_sizes)
 
-        sigma_agg = 0.0
-        sensitivity_l2 = 0.0
-        noise_multiplier = 0.0
-        noise_multiplier_base = 0.0
-        relative_noise_rdp_factor = 1.0
+        sampling_rate = float(self.cfg.data.clients_per_round) / float(self.cfg.data.num_clients)
+        compressor_ratio = float(self.cfg.compressor.topk_ratio) if str(self.cfg.compressor.type) == "topk" else 1.0
+        privacy_state = self.privacy_engine.calibrate_round(
+            client_weights=client_weights,
+            clip_norm=clip_norm,
+            sampling_rate=sampling_rate,
+            compressor_ratio=compressor_ratio,
+        )
 
-        if self.privacy_accountant is not None:
-            if (
-                self.config.dp.use_heterogeneous_noise
-                and self.config.dp.account_for_relative_noise_in_rdp
-            ):
-                min_rel = max(float(self.config.dp.min_relative_noise), 1e-12)
-                max_rel = max(float(self.config.dp.max_relative_noise), min_rel)
-                # Conservative lower bound after RMS normalization.
-                relative_noise_rdp_factor = min_rel / max_rel
+        global_weights = self.server.get_global_weights()
+        client_updates = self._run_clients_parallel(
+            selected_ids=selected_ids,
+            global_weights=global_weights,
+            clip_norm=clip_norm,
+            clip_weight_template=clip_weight_template,
+            round_num=round_num,
+        )
 
-            noise_multiplier = self.privacy_accountant.solve_noise_multiplier_for_round(
-                q=q_accounting,
-                steps=self.config.dp.rdp_steps_per_round,
-            )
-            noise_multiplier_base = noise_multiplier / max(relative_noise_rdp_factor, 1e-12)
+        aggregated_importance = self.server.aggregate_importance(client_updates)
+        clean_update = self.server._weighted_aggregate(
+            [update.delta_w for update in client_updates],
+            [update.data_size for update in client_updates],
+        )
 
-            sensitivity_l2 = compute_weighted_sensitivity(
-                client_weights=client_weights,
-                clip_norm=clip_norm,
-            )
-            sigma_agg = noise_multiplier_base * sensitivity_l2
-        else:
-            sigma_agg = 0.0
+        server_generator = self._make_generator(round_num=round_num, client_id=-1)
+        noisy_update = self.privacy_engine.add_server_noise(
+            global_update=clean_update,
+            sigma_agg=privacy_state.sigma_agg,
+            use_heterogeneous_noise=bool(self.cfg.dp.use_heterogeneous_noise),
+            clip_weight_template=clip_weight_template,
+            generator=server_generator,
+        )
 
-        actual_sigma = float(sigma_agg)
-        z_base = float(noise_multiplier_base)
-        snr = (
-            float(clip_norm / max(actual_sigma, 1e-12))
-            if self.privacy_accountant is not None
+        aggregated = self.server.aggregate(client_updates=client_updates, noisy_update=noisy_update)
+        train_metrics = self.server.update_global_model(
+            global_update=aggregated.noisy_update,
+            stats_aggregated=aggregated.stats_aggregated,
+            aggregated_importance=aggregated_importance,
+        )
+
+        expected_noise_l2_norm = float(privacy_state.sigma_agg * math.sqrt(max(1, aggregated.total_params)))
+        snr_signal_to_noise = (
+            float(aggregated.signal_l2_norm / max(expected_noise_l2_norm, 1e-12))
+            if privacy_state.sigma_agg > 0
             else 0.0
         )
-        global_weights = self.server.get_global_weights()
 
-        client_updates = []
-        upload_ratios: List[float] = []
-        viz_client_id: Optional[int] = None
-        viz_importance: Optional[torch.Tensor] = None
-        viz_mask: Optional[torch.Tensor] = None
-
-        for client_id in selected_ids:
-            client = self.clients[client_id]
-            need_viz = (
-                self.config.importance_viz_enabled
-                and (round_num % max(1, self.config.importance_viz_interval) == 0)
-                and (client_id == self.config.importance_viz_client)
-            )
-            update = client.train_and_upload(
-                global_weights=global_weights,
-                clip_norm=clip_norm,
-                return_importance_snapshot=need_viz,
-                importance_max_elements=self.config.importance_viz_max_elements,
-            )
-            client_updates.append(update)
-            upload_ratios.append(update.upload_ratio)
-            if need_viz and update.importance_vector is not None:
-                viz_client_id = client_id
-                viz_importance = update.importance_vector
-                viz_mask = update.mask_vector
-
-        aggregated = self.server.aggregate(
-            client_updates=client_updates,
-            sigma_agg=sigma_agg,
-            dp_config=self.config.dp,
-            stats_agg_method=self.config.edge.stats_agg_method,
+        train_metrics.update(
+            {
+                "avg_upload_ratio": float(np.mean([u.upload_ratio for u in client_updates])) if client_updates else 1.0,
+                "noise_multiplier": float(privacy_state.noise_multiplier),
+                "sigma_agg": float(privacy_state.sigma_agg),
+                "sensitivity_l2": float(privacy_state.sensitivity_l2),
+                "clip_snr_proxy": float(privacy_state.clip_snr_proxy),
+                "signal_l2_norm": float(aggregated.signal_l2_norm),
+                "expected_noise_l2_norm": float(expected_noise_l2_norm),
+                "snr_signal_to_noise": float(snr_signal_to_noise),
+            }
         )
 
-        train_metrics = self.server.update_global_model(
-            global_update=aggregated.global_update,
-            stats_aggregated=aggregated.stats_aggregated,
-        )
-
-        train_metrics["avg_noise_sigma"] = float(sigma_agg)
-        train_metrics["avg_upload_ratio"] = (
-            float(np.mean(upload_ratios)) if upload_ratios else 1.0
-        )
-        train_metrics["noise_multiplier"] = float(noise_multiplier)
-        train_metrics["noise_multiplier_base"] = float(noise_multiplier_base)
-        train_metrics["relative_noise_rdp_factor"] = float(relative_noise_rdp_factor)
-        train_metrics["sigma_agg"] = float(sigma_agg)
-        train_metrics["sigma_base"] = float(sigma_agg)
-        train_metrics["sensitivity_l2"] = float(sensitivity_l2)
-        train_metrics["z"] = z_base
-        train_metrics["actual_sigma"] = actual_sigma
-        train_metrics["snr"] = snr
-        if viz_importance is not None and viz_client_id is not None:
-            self._save_importance_visualization(
-                round_num=round_num,
-                client_id=viz_client_id,
-                importance_vector=viz_importance,
-                mask_vector=viz_mask,
-            )
-
-        if self.privacy_accountant is not None:
-            eps_spent = self.privacy_accountant.consume_round(
-                noise_multiplier=noise_multiplier,
-                q=q_accounting,
-                steps=self.config.dp.rdp_steps_per_round,
-            )
+        if self.privacy_engine.is_enabled():
+            eps_spent = self.privacy_engine.consume_round(privacy_state)
             train_metrics["epsilon_spent"] = float(eps_spent)
-            train_metrics["epsilon_remaining"] = float(
-                self.privacy_accountant.remaining_budget()
-            )
+            train_metrics["epsilon_remaining"] = float(self.privacy_engine.remaining_budget())
 
         return train_metrics
 
-    def _save_importance_visualization(
+    def _run_clients_parallel(
         self,
+        selected_ids: List[int],
+        global_weights,
+        clip_norm: float,
+        clip_weight_template,
         round_num: int,
-        client_id: int,
-        importance_vector: torch.Tensor,
-        mask_vector: Optional[torch.Tensor] = None,
-    ) -> None:
-        """Save heatmap + raw snapshot for importance/mask vectors."""
-        viz_dir = os.path.join(self.config.log_dir, "importance_viz")
-        os.makedirs(viz_dir, exist_ok=True)
+    ):
+        client_updates = []
+        with ThreadPoolExecutor(max_workers=int(self.cfg.trainer.max_workers)) as executor:
+            futures = []
+            for client_id in selected_ids:
+                futures.append(
+                    executor.submit(
+                        self.clients[client_id].train_and_upload,
+                        global_weights=copy_to_cpu(global_weights),
+                        clip_norm=clip_norm,
+                        clip_weight_template=copy_to_cpu(clip_weight_template),
+                        return_importance_snapshot=self._need_viz(round_num, client_id),
+                        importance_max_elements=int(self.cfg.importance_viz.max_elements),
+                        generator=self._make_generator(round_num=round_num, client_id=client_id),
+                    )
+                )
 
-        vec = importance_vector.detach().float().cpu().numpy()
-        side = int(math.ceil(math.sqrt(vec.size)))
-        padded = np.full((side * side,), np.nan, dtype=np.float32)
-        padded[: vec.size] = vec
-        imp_mat = padded.reshape(side, side)
+            for future in as_completed(futures):
+                client_updates.append(future.result())
+        return client_updates
 
-        mask_mat = None
-        if mask_vector is not None:
-            mvec = mask_vector.detach().float().cpu().numpy()
-            mpad = np.full((side * side,), np.nan, dtype=np.float32)
-            mpad[: min(mvec.size, side * side)] = mvec[: side * side]
-            mask_mat = mpad.reshape(side, side)
-
-        npz_path = os.path.join(viz_dir, f"round_{round_num:04d}_client_{client_id}.npz")
-        np.savez_compressed(
-            npz_path,
-            importance_vector=vec,
-            mask_vector=(
-                mask_vector.detach().float().cpu().numpy()
-                if mask_vector is not None
-                else np.array([], dtype=np.float32)
-            ),
+    def _need_viz(self, round_num: int, client_id: int) -> bool:
+        return (
+            bool(self.cfg.importance_viz.enabled)
+            and round_num % max(1, int(self.cfg.importance_viz.interval)) == 0
+            and client_id == int(self.cfg.importance_viz.client_id)
         )
 
-        try:
-            import matplotlib.pyplot as plt
+    def _make_generator(self, round_num: int, client_id: int) -> torch.Generator:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(self.cfg.seed) * 100000 + round_num * 1000 + client_id + 17)
+        return generator
 
-            cols = 2 if mask_mat is not None else 1
-            fig, axes = plt.subplots(1, cols, figsize=(6 * cols, 5), dpi=120)
-            if cols == 1:
-                axes = [axes]
-
-            ax0 = axes[0]
-            im0 = ax0.imshow(np.log1p(np.nan_to_num(imp_mat, nan=0.0)), cmap="viridis", aspect="auto")
-            ax0.set_title(f"Importance Heatmap (R{round_num}, C{client_id})")
-            ax0.set_xlabel("Index")
-            ax0.set_ylabel("Index")
-            fig.colorbar(im0, ax=ax0, fraction=0.046, pad=0.04)
-
-            if mask_mat is not None:
-                ax1 = axes[1]
-                im1 = ax1.imshow(np.nan_to_num(mask_mat, nan=0.0), cmap="gray_r", vmin=0.0, vmax=1.0, aspect="auto")
-                ax1.set_title("Top-k Mask Snapshot")
-                ax1.set_xlabel("Index")
-                ax1.set_ylabel("Index")
-                fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
-
-            fig.tight_layout()
-            png_path = os.path.join(viz_dir, f"round_{round_num:04d}_client_{client_id}.png")
-            fig.savefig(png_path)
-            plt.close(fig)
-        except Exception as exc:
-            print(f"[importance_viz] plot failed at round {round_num}: {exc}")
+    def _build_client_weights(self, selected_sizes: List[int]) -> List[float]:
+        if str(self.cfg.server.aggregation_weight_strategy) == "equal":
+            return [1.0 / max(1, len(selected_sizes)) for _ in selected_sizes]
+        total_selected = sum(selected_sizes)
+        if total_selected <= 0:
+            return [1.0 / max(1, len(selected_sizes)) for _ in selected_sizes]
+        return [size / total_selected for size in selected_sizes]
 
     def evaluate(self) -> Dict[str, float]:
         return self.server.evaluate(self.test_loader)
@@ -312,8 +243,8 @@ class FLTrainer:
         best_acc = 0.0
         last_eval = {"accuracy": 0.0, "loss": 0.0}
 
-        for round_num in tqdm(range(1, self.config.num_rounds + 1), desc="Training"):
-            if self.privacy_accountant is not None and self.privacy_accountant.is_exhausted():
+        for round_num in tqdm(range(1, int(self.cfg.trainer.num_rounds) + 1), desc="Training"):
+            if self.privacy_engine.is_exhausted():
                 print(f"Privacy budget exhausted at round {round_num}.")
                 break
 
@@ -321,61 +252,59 @@ class FLTrainer:
             test_metrics = self.evaluate()
             last_eval = test_metrics
 
-            self.history["rounds"].append(round_num)
-            self.history["train_metrics"].append(train_metrics)
-            self.history["test_metrics"].append(test_metrics)
-            self.history["clip_history"].append(train_metrics.get("new_clip", 0.0))
-            self.history["upload_ratio"].append(train_metrics.get("avg_upload_ratio", 1.0))
-            self.history["noise_multiplier"].append(train_metrics.get("noise_multiplier", 0.0))
-            self.history["noise_multiplier_base"].append(train_metrics.get("noise_multiplier_base", 0.0))
-            self.history["sigma_agg"].append(train_metrics.get("sigma_agg", 0.0))
-            self.history["sigma_base"].append(train_metrics.get("sigma_base", 0.0))
-            self.history["actual_sigma"].append(train_metrics.get("actual_sigma", 0.0))
-            self.history["snr"].append(train_metrics.get("snr", 0.0))
+            self.history.rounds.append(round_num)
+            self.history.train_metrics.append(train_metrics)
+            self.history.test_metrics.append(test_metrics)
+            self.history.clip_history.append(train_metrics.get("new_clip", 0.0))
+            self.history.upload_ratio.append(train_metrics.get("avg_upload_ratio", 1.0))
+            self.history.noise_multiplier.append(train_metrics.get("noise_multiplier", 0.0))
+            self.history.sigma_agg.append(train_metrics.get("sigma_agg", 0.0))
+            self.history.clip_snr_proxy.append(train_metrics.get("clip_snr_proxy", 0.0))
+            self.history.signal_l2_norm.append(train_metrics.get("signal_l2_norm", 0.0))
+            self.history.expected_noise_l2_norm.append(train_metrics.get("expected_noise_l2_norm", 0.0))
+            self.history.snr_signal_to_noise.append(train_metrics.get("snr_signal_to_noise", 0.0))
 
-            if self.privacy_accountant is not None:
-                self.history["privacy_spent"].append(train_metrics.get("epsilon_spent", 0.0))
+            if self.privacy_engine.is_enabled():
+                self.history.privacy_spent.append(train_metrics.get("epsilon_spent", 0.0))
 
-            if round_num % self.config.log_interval == 0:
+            if round_num % int(self.cfg.trainer.log_interval) == 0:
                 msg = (
                     f"Round {round_num:03d} | "
                     f"Acc={test_metrics['accuracy']:.2%} | "
                     f"Loss={test_metrics['loss']:.4f} | "
                     f"Clip={train_metrics.get('new_clip', 0.0):.4f} | "
-                    f"Upload={train_metrics.get('avg_upload_ratio', 1.0):.2%}"
+                    f"Upload={train_metrics.get('avg_upload_ratio', 1.0):.2%} | "
+                    f"signal={train_metrics.get('signal_l2_norm', 0.0):.4f} | "
+                    f"noise={train_metrics.get('expected_noise_l2_norm', 0.0):.4f} | "
+                    f"SNR={train_metrics.get('snr_signal_to_noise', 0.0):.4f}"
                 )
-                if self.privacy_accountant is not None:
-                    msg += (
-                        f" | eps={train_metrics.get('epsilon_spent', 0.0):.4f}"
-                        f" | z={train_metrics.get('z', 0.0):.4f}"
-                        f" | actual_sigma={train_metrics.get('actual_sigma', 0.0):.4f}"
-                        f" | SNR={train_metrics.get('snr', 0.0):.4f}"
-                    )
+                if self.privacy_engine.is_enabled():
+                    msg += f" | eps={train_metrics.get('epsilon_spent', 0.0):.4f}"
                 tqdm.write(msg)
 
             if test_metrics["accuracy"] > best_acc:
                 best_acc = test_metrics["accuracy"]
                 self._save_checkpoint(round_num, is_best=True)
 
-            if round_num % self.config.save_interval == 0:
+            if round_num % int(self.cfg.trainer.save_interval) == 0:
                 self._save_checkpoint(round_num)
 
-        final_round = self.history["rounds"][-1] if self.history["rounds"] else 0
+        final_round = self.history.rounds[-1] if self.history.rounds else 0
         self._save_checkpoint(final_round, is_final=True)
         self._save_history()
 
         print("=" * 72)
         print("Training complete")
         print(f"Best accuracy: {best_acc:.2%}")
-        if self.privacy_accountant is not None:
-            print(f"Final epsilon: {self.privacy_accountant.current_epsilon():.6f}")
+        if self.privacy_engine.is_enabled():
+            print(f"Final epsilon: {self.privacy_engine.current_epsilon():.6f}")
         print("=" * 72)
 
         return {
             "best_accuracy": float(best_acc),
             "final_accuracy": float(last_eval["accuracy"]),
             "final_loss": float(last_eval["loss"]),
-            "total_rounds": float(len(self.history["rounds"])),
+            "total_rounds": float(len(self.history.rounds)),
         }
 
     def _save_checkpoint(
@@ -388,33 +317,32 @@ class FLTrainer:
             "round": round_num,
             "model_state_dict": self.server.global_model.state_dict(),
             "clip_norm": self.server.clip_norm,
-            "config": self._config_to_dict(self.config),
+            "config": OmegaConf.to_container(self.cfg, resolve=True),
         }
 
         if is_best:
-            path = os.path.join(self.config.save_dir, "best_model.pt")
+            path = os.path.join(str(self.cfg.trainer.save_dir), "best_model.pt")
         elif is_final:
-            path = os.path.join(self.config.save_dir, "final_model.pt")
+            path = os.path.join(str(self.cfg.trainer.save_dir), "final_model.pt")
         else:
-            path = os.path.join(self.config.save_dir, f"checkpoint_round_{round_num}.pt")
+            path = os.path.join(str(self.cfg.trainer.save_dir), f"checkpoint_round_{round_num}.pt")
 
         torch.save(checkpoint, path)
 
     def _save_history(self) -> None:
         history_data = {
-            "rounds": self.history["rounds"],
-            "test_accuracy": [m["accuracy"] for m in self.history["test_metrics"]],
-            "test_loss": [m["loss"] for m in self.history["test_metrics"]],
-            "clip_history": self.history["clip_history"],
-            "privacy_spent": self.history["privacy_spent"],
-            "noise_sigma": [m.get("avg_noise_sigma", 0.0) for m in self.history["train_metrics"]],
-            "upload_ratio": self.history["upload_ratio"],
-            "noise_multiplier": self.history["noise_multiplier"],
-            "noise_multiplier_base": self.history["noise_multiplier_base"],
-            "sigma_agg": self.history["sigma_agg"],
-            "sigma_base": self.history["sigma_base"],
-            "actual_sigma": self.history["actual_sigma"],
-            "snr": self.history["snr"],
+            "rounds": self.history.rounds,
+            "test_accuracy": [m["accuracy"] for m in self.history.test_metrics],
+            "test_loss": [m["loss"] for m in self.history.test_metrics],
+            "clip_history": self.history.clip_history,
+            "privacy_spent": self.history.privacy_spent,
+            "upload_ratio": self.history.upload_ratio,
+            "noise_multiplier": self.history.noise_multiplier,
+            "sigma_agg": self.history.sigma_agg,
+            "clip_snr_proxy": self.history.clip_snr_proxy,
+            "signal_l2_norm": self.history.signal_l2_norm,
+            "expected_noise_l2_norm": self.history.expected_noise_l2_norm,
+            "snr_signal_to_noise": self.history.snr_signal_to_noise,
         }
 
         summary = {
@@ -424,7 +352,6 @@ class FLTrainer:
             "total_rounds": len(history_data["rounds"]),
             "final_epsilon": history_data["privacy_spent"][-1] if history_data["privacy_spent"] else 0.0,
             "final_clip_norm": history_data["clip_history"][-1] if history_data["clip_history"] else 0.0,
-            "final_upload_ratio": history_data["upload_ratio"][-1] if history_data["upload_ratio"] else 1.0,
         }
 
         full_record = {
@@ -432,172 +359,62 @@ class FLTrainer:
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "device": str(self.device),
             },
-            "config": self._config_to_dict(self.config),
+            "config": OmegaConf.to_container(self.cfg, resolve=True),
             "summary": summary,
             "history": history_data,
         }
 
-        os.makedirs(self.config.log_dir, exist_ok=True)
-        record_path = os.path.join(self.config.log_dir, "experiment_record.json")
+        os.makedirs(str(self.cfg.trainer.log_dir), exist_ok=True)
+        record_path = os.path.join(str(self.cfg.trainer.log_dir), "experiment_record.json")
         with open(record_path, "w", encoding="utf-8") as f:
             json.dump(full_record, f, indent=2, ensure_ascii=False)
 
-        history_path = os.path.join(self.config.log_dir, "history.json")
+        history_path = os.path.join(str(self.cfg.trainer.log_dir), "history.json")
         with open(history_path, "w", encoding="utf-8") as f:
             json.dump(history_data, f, indent=2, ensure_ascii=False)
 
-        summary_path = os.path.join(self.config.log_dir, "config_summary.txt")
-        with open(summary_path, "w", encoding="utf-8") as f:
-            f.write(json.dumps(self._config_to_dict(self.config), indent=2, ensure_ascii=False))
 
-    @staticmethod
-    def _config_to_dict(config: ExperimentConfig) -> dict:
-        return {
-            "seed": config.seed,
-            "num_clients": config.num_clients,
-            "clients_per_round": config.clients_per_round,
-            "num_rounds": config.num_rounds,
-            "batch_size": config.batch_size,
-            "dataset": config.dataset,
-            "iid": config.iid,
-            "alpha": config.alpha,
-            "model": config.model,
-            "num_classes": config.num_classes,
-            "client": {
-                "training_strategy": config.client.training_strategy.value,
-                "local_epochs": config.client.local_epochs,
-                "lr": config.client.lr,
-                "momentum": config.client.momentum,
-                "weight_decay": config.client.weight_decay,
-                "alpha": config.client.alpha,
-                "beta": config.client.beta,
-                "contrastive_margin": config.client.contrastive_margin,
-                "mu": config.client.mu,
-                "sam_rho": config.client.sam_rho,
-                "importance_strategy": config.client.importance_strategy.value,
-                "topk_strategy": config.client.topk_strategy.value,
-                "topk_ratio": config.client.topk_ratio,
-                "layer_weight_method": config.client.layer_weight_method.value,
-                "stat_type": config.client.stat_type.value,
-                "use_residual": config.client.use_residual,
-            },
-            "server": {
-                "server_lr": config.server.server_lr,
-                "aggregation_weight_strategy": config.server.aggregation_weight_strategy,
-                "initial_clip": config.server.initial_clip,
-                "clip_update_method": config.server.clip_update_method.value,
-                "target_quantile": config.server.target_quantile,
-                "clip_lr": config.server.clip_lr,
-                "ema_alpha": config.server.ema_alpha,
-                "downlink_strategy": config.server.downlink_strategy.value,
-                "downlink_topk_ratio": config.server.downlink_topk_ratio,
-            },
-            "dp": {
-                "enabled": config.dp.enabled,
-                "epsilon_total": config.dp.epsilon_total,
-                "delta": config.dp.delta,
-                "use_heterogeneous_noise": config.dp.use_heterogeneous_noise,
-                "min_relative_noise": config.dp.min_relative_noise,
-                "max_relative_noise": config.dp.max_relative_noise,
-                "relative_noise_mode": config.dp.relative_noise_mode,
-                "relative_noise_alpha": config.dp.relative_noise_alpha,
-                "relative_noise_eps": config.dp.relative_noise_eps,
-                "account_for_relative_noise_in_rdp": config.dp.account_for_relative_noise_in_rdp,
-                "rdp_orders": list(config.dp.rdp_orders),
-                "rdp_steps_per_round": config.dp.rdp_steps_per_round,
-                "client_noise_allocation": config.dp.client_noise_allocation,
-                "client_variance_max_scale": config.dp.client_variance_max_scale,
-                "account_for_topk_in_q": config.dp.account_for_topk_in_q,
-                "trusted_server_for_stats": config.dp.trusted_server_for_stats,
-            },
-            "importance_viz": {
-                "enabled": config.importance_viz_enabled,
-                "interval": config.importance_viz_interval,
-                "client_id": config.importance_viz_client,
-                "max_elements": config.importance_viz_max_elements,
-            },
-        }
+def copy_to_cpu(tensors):
+    if tensors is None:
+        return None
+    return {name: tensor.detach().cpu().clone() for name, tensor in tensors.items()}
 
 
-def run_experiment(experiment_name: str, config: ExperimentConfig) -> Dict[str, float]:
+def load_config(argv: List[str]) -> DictConfig:
+    base_cfg = OmegaConf.load(Path("configs") / "base.yaml")
+    cli_cfg = OmegaConf.from_dotlist(argv)
+    cfg = OmegaConf.merge(base_cfg, cli_cfg)
+
+    experiment_name = str(cfg.experiment.name)
+    if experiment_name in {"fedavg", "dp_fedavg", "dp_fedsam"}:
+        cfg.compressor.type = "identity"
+        cfg.compressor.use_residual = False
+        cfg.compressor.topk_ratio = 1.0
+    if experiment_name == "fedavg":
+        cfg.dp.enabled = False
+    if experiment_name == "dp_fedavg":
+        cfg.client.training_strategy = "standard"
+        cfg.dp.use_heterogeneous_noise = False
+        cfg.server.clip_update_method = "ema"
+        cfg.server.ema_alpha = 1.0
+    if experiment_name == "dp_fedsam":
+        cfg.client.training_strategy = "dp_fedsam"
+        cfg.dp.use_heterogeneous_noise = False
+        cfg.server.clip_update_method = "ema"
+        cfg.server.ema_alpha = 1.0
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    config.save_dir = f"./checkpoints/{experiment_name}_{timestamp}"
-    config.log_dir = f"./logs/{experiment_name}_{timestamp}"
-
-    trainer = FLTrainer(config)
-    return trainer.train()
+    cfg.trainer.save_dir = f"./checkpoints/{experiment_name}_{timestamp}"
+    cfg.trainer.log_dir = f"./logs/{experiment_name}_{timestamp}"
+    return cfg
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Federated learning training")
-    parser.add_argument(
-        "--experiment",
-        type=str,
-        default="proposed",
-        choices=["fedavg", "dp_fedavg", "dp_fedsam", "proposed"],
-    )
-    parser.add_argument("--num_rounds", type=int, default=100)
-    parser.add_argument("--num_clients", type=int, default=100)
-    parser.add_argument("--clients_per_round", type=int, default=10)
-    parser.add_argument("--epsilon", type=float, default=8.0)
-    parser.add_argument("--topk_ratio", type=float, default=0.1)
-    parser.add_argument("--iid", action="store_true")
-    parser.add_argument("--alpha", type=float, default=0.5)
-    parser.add_argument("--dataset", type=str, choices=["cifar10", "mnist"], default="cifar10")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--importance_viz", action="store_true")
-    parser.add_argument("--importance_viz_interval", type=int, default=10)
-    parser.add_argument("--importance_viz_client", type=int, default=0)
-    parser.add_argument("--importance_viz_max_elements", type=int, default=4096)
-    parser.add_argument(
-        "--client_noise_allocation",
-        type=str,
-        choices=["uniform", "heterogeneous"],
-        default="uniform",
-    )
-    parser.add_argument("--client_variance_max_scale", type=float, default=10.0)
-    parser.add_argument("--account_for_topk_in_q", action="store_true")
-    parser.add_argument(
-        "--aggregation_weight_strategy",
-        type=str,
-        choices=["data_size", "equal"],
-        default="data_size",
-    )
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-
-    if args.experiment == "fedavg":
-        config = get_fedavg_config()
-    elif args.experiment == "dp_fedavg":
-        config = get_dp_fedavg_config(epsilon=args.epsilon)
-    elif args.experiment == "dp_fedsam":
-        config = get_dp_fedsam_config(epsilon=args.epsilon)
-    else:
-        config = get_proposed_config(epsilon=args.epsilon)
-
-    config.num_rounds = args.num_rounds
-    config.num_clients = args.num_clients
-    config.clients_per_round = args.clients_per_round
-    config.iid = args.iid
-    config.alpha = args.alpha
-    config.dataset = args.dataset
-    config.seed = args.seed
-    config.importance_viz_enabled = args.importance_viz
-    config.importance_viz_interval = args.importance_viz_interval
-    config.importance_viz_client = args.importance_viz_client
-    config.importance_viz_max_elements = args.importance_viz_max_elements
-    config.dp.client_noise_allocation = args.client_noise_allocation
-    config.dp.client_variance_max_scale = args.client_variance_max_scale
-    config.dp.account_for_topk_in_q = args.account_for_topk_in_q
-    config.server.aggregation_weight_strategy = args.aggregation_weight_strategy
-
-    if args.experiment == "proposed":
-        config.client.topk_ratio = args.topk_ratio
-
-    results = run_experiment(args.experiment, config)
+def main(argv: Optional[List[str]] = None) -> None:
+    if argv is None:
+        argv = sys.argv[1:]
+    cfg = load_config(argv)
+    trainer = FLTrainer(cfg)
+    results = trainer.train()
     print("Final results:")
     for k, v in results.items():
         print(f"  {k}: {v}")

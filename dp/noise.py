@@ -26,7 +26,7 @@ def _rdp_subsampled_gaussian(q: float, noise_multiplier: float, alpha: float) ->
         raise ValueError("alpha must be > 1")
     return (alpha * (q**2)) / (2.0 * (noise_multiplier**2))
 
-
+# 将rdp转化成(epsilon, delta)-dp的函数，采用最佳阶数搜索的方法。
 def _epsilon_from_rdp(rdp_values: Dict[float, float], delta: float) -> float:
     """Convert accumulated RDP to (epsilon, delta)-DP by best order search."""
 
@@ -99,12 +99,12 @@ class RDPAccountant:
         def total_eps(z: float) -> float:
             total_rdp = {
                 alpha: self.num_rounds
-                * steps
+                * steps #这里的steps是什么东西？
                 * _rdp_subsampled_gaussian(
                     q=q,
                     noise_multiplier=z,
                     alpha=alpha,
-                )
+                ) 
                 for alpha in self.orders
             }
             return _epsilon_from_rdp(total_rdp, self.delta)
