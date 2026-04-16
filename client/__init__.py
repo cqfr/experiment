@@ -1,7 +1,3 @@
-"""
-客户端模块
-"""
+from .client import ClientUpdate, FLClient
 
-from .client import FLClient, ClientUpdate
-
-__all__ = ["FLClient", "ClientUpdate"]
+__all__ = ["ClientUpdate", "FLClient"]

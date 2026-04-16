@@ -65,9 +65,6 @@ dp:
   use_heterogeneous_noise: true
   min_relative_noise: 0.3
   max_relative_noise: 3.0
-  relative_noise_mode: inverse_power
-  relative_noise_alpha: 1.0
-  relative_noise_eps: 1.0e-6
   template_ema: 0.9
   account_for_topk_in_q: false
   rdp_orders: [2, 3, 4, 5, 8, 16, 32, 64, 128, 256]

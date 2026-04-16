@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 """Federated server implementation."""
 
@@ -15,8 +15,6 @@ TensorDict = Dict[str, torch.Tensor]
 
 @dataclass
 class AggregatedResult:
-    """Aggregation output on server side."""
-
     clean_update: TensorDict
     noisy_update: TensorDict
     stats_aggregated: Dict[str, float]
@@ -25,7 +23,7 @@ class AggregatedResult:
 
 
 class FLServer:
-    """Server for aggregation, clipping template maintenance, and evaluation."""
+    """Server for aggregation, clip-template maintenance, and evaluation."""
 
     def __init__(self, model: nn.Module, cfg, device: torch.device):
         self.cfg = cfg
@@ -37,7 +35,12 @@ class FLServer:
         self.stats_history: List[Dict[str, float]] = []
         self.current_round = 0
 
-        self.clip_weight_template = {
+        self.clip_weight_template: TensorDict = {
+            name: torch.ones_like(param.detach()).cpu()
+            for name, param in self.global_model.named_parameters()
+            if param.requires_grad
+        }
+        self.importance_ema_template: TensorDict = {
             name: torch.ones_like(param.detach()).cpu()
             for name, param in self.global_model.named_parameters()
             if param.requires_grad
@@ -52,19 +55,14 @@ class FLServer:
     def get_clip_weight_template(self) -> TensorDict:
         return copy.deepcopy(self.clip_weight_template)
 
-    def aggregate(
-        self,
-        client_updates,
-        noisy_update: TensorDict,
-    ) -> AggregatedResult:
+    def aggregate(self, client_updates, noisy_update: TensorDict) -> AggregatedResult:
         deltas = [update.delta_w for update in client_updates]
         data_sizes = [update.data_size for update in client_updates]
-        stats = [update.stat for update in client_updates]
 
         clean_update = self._weighted_aggregate(deltas, data_sizes)
         signal_l2_norm = self._l2_norm(clean_update)
         total_params = sum(tensor.numel() for tensor in clean_update.values())
-        stats_aggregated = self._aggregate_stats(stats)
+        stats_aggregated = self._aggregate_stats(client_updates)
 
         return AggregatedResult(
             clean_update=clean_update,
@@ -83,7 +81,7 @@ class FLServer:
         with torch.no_grad():
             for name, param in self.global_model.named_parameters():
                 if name in global_update:
-                    param.data += float(self.cfg.server.server_lr) * global_update[name].to(self.device)
+                    param.add_(float(self.cfg.server.server_lr) * global_update[name].to(self.device))
 
         old_clip = self.clip_norm
         self._update_clip_norm(stats_aggregated)
@@ -112,11 +110,10 @@ class FLServer:
 
         with torch.no_grad():
             for data, target in test_loader:
-                data = data.to(self.device)
-                target = target.to(self.device)
+                data = data.to(self.device, non_blocking=True)
+                target = target.to(self.device, non_blocking=True)
                 logits = self.global_model(data)
                 loss = criterion(logits, target)
-
                 total_loss += float(loss.item()) * data.size(0)
                 pred = logits.argmax(dim=1)
                 correct += int((pred == target).sum().item())
@@ -130,37 +127,6 @@ class FLServer:
             "total": float(total),
         }
 
-    def _weighted_aggregate(
-        self,
-        client_updates: List[TensorDict],
-        data_sizes: List[int],
-    ) -> TensorDict:
-        if not client_updates:
-            return {}
-
-        if str(self.cfg.server.aggregation_weight_strategy) == "equal":
-            uniform_weight = 1.0 / max(1, len(client_updates))
-            weights = [uniform_weight for _ in client_updates]
-        else:
-            total_data = sum(data_sizes)
-            if total_data > 0:
-                weights = [size / total_data for size in data_sizes]
-            else:
-                uniform_weight = 1.0 / max(1, len(client_updates))
-                weights = [uniform_weight for _ in client_updates]
-
-        global_update: TensorDict = {}
-        for name in client_updates[0].keys():
-            acc = None
-            for i, update in enumerate(client_updates):
-                if name not in update:
-                    continue
-                term = update[name] * weights[i]
-                acc = term.clone() if acc is None else (acc + term)
-            if acc is not None:
-                global_update[name] = acc
-        return global_update
-
     def aggregate_importance(self, client_updates) -> Optional[TensorDict]:
         importance_updates = [update.importance_dict for update in client_updates if update.importance_dict is not None]
         if not importance_updates:
@@ -168,15 +134,40 @@ class FLServer:
 
         aggregated: TensorDict = {}
         for name in importance_updates[0].keys():
-            stacked = [importance[name].float() for importance in importance_updates if name in importance]
-            if stacked:
-                aggregated[name] = torch.stack(stacked, dim=0).mean(dim=0)
+            tensors = [importance[name].float() for importance in importance_updates if name in importance]
+            if tensors:
+                aggregated[name] = torch.stack(tensors, dim=0).mean(dim=0)
         return aggregated if aggregated else None
+
+    def _weighted_aggregate(self, client_updates: List[TensorDict], data_sizes: List[int]) -> TensorDict:
+        if not client_updates:
+            return {}
+
+        if str(self.cfg.server.aggregation_weight_strategy) == "equal":
+            weights = [1.0 / max(1, len(client_updates)) for _ in client_updates]
+        else:
+            total_data = sum(data_sizes)
+            if total_data <= 0:
+                weights = [1.0 / max(1, len(client_updates)) for _ in client_updates]
+            else:
+                weights = [size / total_data for size in data_sizes]
+
+        aggregated: TensorDict = {}
+        for name in client_updates[0].keys():
+            acc = None
+            for idx, update in enumerate(client_updates):
+                if name not in update:
+                    continue
+                term = update[name] * weights[idx]
+                acc = term.clone() if acc is None else acc + term
+            if acc is not None:
+                aggregated[name] = acc
+        return aggregated
 
     def _update_clip_norm(self, stats: Dict[str, float]) -> None:
         method = str(self.cfg.server.clip_update_method)
         if method == "adaptive":
-            fraction_clipped = float(stats.get("fraction_clipped", 0.5))
+            fraction_clipped = float(stats.get("fraction_clipped", 0.0))
             if fraction_clipped > float(self.cfg.server.target_quantile):
                 self.clip_norm *= 1.0 + float(self.cfg.server.clip_lr)
             else:
@@ -186,10 +177,10 @@ class FLServer:
             alpha = float(self.cfg.server.ema_alpha)
             self.clip_norm = alpha * self.clip_norm + (1.0 - alpha) * median
 
-        self.clip_norm = float(max(1e-2, min(1e3, self.clip_norm)))
+        self.clip_norm = float(max(1e-3, min(1e3, self.clip_norm)))
 
-    def _aggregate_stats(self, stats: List[float]) -> Dict[str, float]:
-        if not stats:
+    def _aggregate_stats(self, client_updates) -> Dict[str, float]:
+        if not client_updates:
             return {
                 "median": 0.0,
                 "q25": 0.0,
@@ -198,45 +189,54 @@ class FLServer:
                 "fraction_clipped": 0.0,
             }
 
-        arr = np.array(stats, dtype=np.float64)
+        norms = np.array([float(update.stat) for update in client_updates], dtype=np.float64)
+        clipped_flags = np.array([1.0 if update.clipped else 0.0 for update in client_updates], dtype=np.float64)
         return {
-            "median": float(np.quantile(arr, 0.5)),
-            "q25": float(np.quantile(arr, 0.25)),
-            "q75": float(np.quantile(arr, 0.75)),
-            "count": float(arr.size),
-            "fraction_clipped": float(np.mean(arr > self.clip_norm)),
+            "median": float(np.quantile(norms, 0.5)),
+            "q25": float(np.quantile(norms, 0.25)),
+            "q75": float(np.quantile(norms, 0.75)),
+            "count": float(norms.size),
+            "fraction_clipped": float(clipped_flags.mean()),
         }
 
     def _update_clip_weight_template(self, aggregated_importance: TensorDict) -> None:
         alpha = float(self.cfg.dp.template_ema)
-        updated_template: TensorDict = {}
-        for name, tensor in self.clip_weight_template.items():
-            new_importance = aggregated_importance.get(name)
-            if new_importance is None:
-                updated_template[name] = tensor
+        updated_importance_ema: TensorDict = {}
+        updated_clip_template: TensorDict = {}
+
+        for name, current_template in self.clip_weight_template.items():
+            public_importance = aggregated_importance.get(name)
+            if public_importance is None:
+                updated_importance_ema[name] = self.importance_ema_template[name]
+                updated_clip_template[name] = current_template
                 continue
 
-            new_template = self._importance_to_template(new_importance)
-            updated_template[name] = alpha * tensor + (1.0 - alpha) * new_template.cpu()
-        self.clip_weight_template = updated_template
+            sanitized_importance = torch.nan_to_num(public_importance.detach().float().abs(), nan=0.0, posinf=0.0, neginf=0.0).cpu()
+            prev_ema = self.importance_ema_template[name]
+            next_ema = alpha * prev_ema + (1.0 - alpha) * sanitized_importance
+            updated_importance_ema[name] = next_ema
+            updated_clip_template[name] = self._importance_to_template(next_ema)
+
+        self.importance_ema_template = updated_importance_ema
+        self.clip_weight_template = updated_clip_template
 
     def _importance_to_template(self, importance: torch.Tensor) -> torch.Tensor:
-        imp = importance.detach().float().abs()
-        imp = torch.nan_to_num(imp, nan=0.0, posinf=0.0, neginf=0.0)
-        if imp.numel() == 0:
-            return torch.ones_like(imp)
+        if importance.numel() == 0:
+            return torch.ones_like(importance)
 
-        imp_mean = imp.mean()
-        if imp_mean <= 0:
-            normalized = torch.ones_like(imp)
+        mean_importance = importance.mean()
+        if mean_importance <= 0:
+            normalized = torch.ones_like(importance)
         else:
-            normalized = imp / imp_mean
+            normalized = importance / mean_importance
 
-        min_rel = float(self.cfg.dp.min_relative_noise)
-        max_rel = float(self.cfg.dp.max_relative_noise)
-        clipped = normalized.clamp(min=min_rel, max=max_rel)
+        inverse_relative_scale = normalized.clamp_min(1e-6).reciprocal()
+        clipped = inverse_relative_scale.clamp(
+            min=float(self.cfg.dp.min_relative_noise),
+            max=float(self.cfg.dp.max_relative_noise),
+        )
         rms = torch.sqrt(torch.mean(clipped.pow(2))).clamp_min(1e-6)
-        return clipped / rms
+        return (clipped / rms).cpu()
 
     @staticmethod
     def _l2_norm(tensors: TensorDict) -> float:
@@ -244,7 +244,3 @@ class FLServer:
             return 0.0
         total = sum(tensor.float().pow(2).sum() for tensor in tensors.values())
         return float(torch.sqrt(total).item())
-
-
-if __name__ == "__main__":
-    print("server module ready")

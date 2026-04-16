@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 """Main federated training entry with OmegaConf and threaded client execution."""
 
@@ -8,7 +8,7 @@ import os
 import random
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -68,13 +68,13 @@ class FLTrainer:
 
         self.clients: List[FLClient] = [
             FLClient(
-                client_id=i,
+                client_id=client_id,
                 model=self._build_model(),
-                dataloader=self.train_loaders[i],
+                dataloader=self.train_loaders[client_id],
                 cfg=cfg,
                 device=self.device,
             )
-            for i in range(int(cfg.data.num_clients))
+            for client_id in range(int(cfg.data.num_clients))
         ]
 
         self.history = ExperimentState()
@@ -107,14 +107,34 @@ class FLTrainer:
     def _select_clients(self, count: int) -> List[int]:
         return random.sample(range(int(self.cfg.data.num_clients)), count)
 
+    def _build_client_weights(self, selected_sizes: List[int]) -> List[float]:
+        if str(self.cfg.server.aggregation_weight_strategy) == "equal":
+            return [1.0 / max(1, len(selected_sizes)) for _ in selected_sizes]
+
+        total_selected = sum(selected_sizes)
+        if total_selected <= 0:
+            return [1.0 / max(1, len(selected_sizes)) for _ in selected_sizes]
+        return [size / total_selected for size in selected_sizes]
+
+    def _need_viz(self, round_num: int, client_id: int) -> bool:
+        return (
+            bool(self.cfg.importance_viz.enabled)
+            and round_num % max(1, int(self.cfg.importance_viz.interval)) == 0
+            and client_id == int(self.cfg.importance_viz.client_id)
+        )
+
+    def _make_generator(self, round_num: int, client_id: int) -> torch.Generator:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(self.cfg.seed) * 100_000 + round_num * 1_000 + client_id + 17)
+        return generator
+
     def train_round(self, round_num: int) -> Dict[str, float]:
         clip_norm = self.server.get_clip_norm()
-        clip_weight_template = None
-        if bool(self.cfg.dp.enabled and self.cfg.dp.use_heterogeneous_noise):
-            clip_weight_template = self.server.get_clip_weight_template()
+        use_heterogeneous_noise = bool(self.cfg.dp.enabled and self.cfg.dp.use_heterogeneous_noise)
+        clip_weight_template = self.server.get_clip_weight_template() if use_heterogeneous_noise else None
 
         selected_ids = self._select_clients(int(self.cfg.data.clients_per_round))
-        selected_sizes = [self.clients[idx].data_size for idx in selected_ids]
+        selected_sizes = [self.clients[client_id].data_size for client_id in selected_ids]
         client_weights = self._build_client_weights(selected_sizes)
 
         sampling_rate = float(self.cfg.data.clients_per_round) / float(self.cfg.data.num_clients)
@@ -141,13 +161,12 @@ class FLTrainer:
             [update.data_size for update in client_updates],
         )
 
-        server_generator = self._make_generator(round_num=round_num, client_id=-1)
         noisy_update = self.privacy_engine.add_server_noise(
             global_update=clean_update,
             sigma_agg=privacy_state.sigma_agg,
-            use_heterogeneous_noise=bool(self.cfg.dp.use_heterogeneous_noise),
+            use_heterogeneous_noise=use_heterogeneous_noise,
             clip_weight_template=clip_weight_template,
-            generator=server_generator,
+            generator=self._make_generator(round_num=round_num, client_id=-1),
         )
 
         aggregated = self.server.aggregate(client_updates=client_updates, noisy_update=noisy_update)
@@ -163,16 +182,17 @@ class FLTrainer:
             if privacy_state.sigma_agg > 0
             else 0.0
         )
+        avg_upload_ratio = float(np.mean([update.upload_ratio for update in client_updates])) if client_updates else 1.0
 
         train_metrics.update(
             {
-                "avg_upload_ratio": float(np.mean([u.upload_ratio for u in client_updates])) if client_updates else 1.0,
+                "avg_upload_ratio": avg_upload_ratio,
                 "noise_multiplier": float(privacy_state.noise_multiplier),
                 "sigma_agg": float(privacy_state.sigma_agg),
                 "sensitivity_l2": float(privacy_state.sensitivity_l2),
                 "clip_snr_proxy": float(privacy_state.clip_snr_proxy),
                 "signal_l2_norm": float(aggregated.signal_l2_norm),
-                "expected_noise_l2_norm": float(expected_noise_l2_norm),
+                "expected_noise_l2_norm": expected_noise_l2_norm,
                 "snr_signal_to_noise": float(snr_signal_to_noise),
             }
         )
@@ -193,44 +213,24 @@ class FLTrainer:
         round_num: int,
     ):
         client_updates = []
-        with ThreadPoolExecutor(max_workers=int(self.cfg.trainer.max_workers)) as executor:
-            futures = []
-            for client_id in selected_ids:
-                futures.append(
-                    executor.submit(
-                        self.clients[client_id].train_and_upload,
-                        global_weights=copy_to_cpu(global_weights),
-                        clip_norm=clip_norm,
-                        clip_weight_template=copy_to_cpu(clip_weight_template),
-                        return_importance_snapshot=self._need_viz(round_num, client_id),
-                        importance_max_elements=int(self.cfg.importance_viz.max_elements),
-                        generator=self._make_generator(round_num=round_num, client_id=client_id),
-                    )
+        max_workers = int(self.cfg.trainer.max_workers)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(
+                    self.clients[client_id].train_and_upload,
+                    global_weights=copy_to_cpu(global_weights),
+                    clip_norm=clip_norm,
+                    clip_weight_template=copy_to_cpu(clip_weight_template),
+                    return_importance_snapshot=self._need_viz(round_num, client_id),
+                    importance_max_elements=int(self.cfg.importance_viz.max_elements),
+                    generator=self._make_generator(round_num=round_num, client_id=client_id),
                 )
+                for client_id in selected_ids
+            ]
 
             for future in as_completed(futures):
                 client_updates.append(future.result())
         return client_updates
-
-    def _need_viz(self, round_num: int, client_id: int) -> bool:
-        return (
-            bool(self.cfg.importance_viz.enabled)
-            and round_num % max(1, int(self.cfg.importance_viz.interval)) == 0
-            and client_id == int(self.cfg.importance_viz.client_id)
-        )
-
-    def _make_generator(self, round_num: int, client_id: int) -> torch.Generator:
-        generator = torch.Generator(device="cpu")
-        generator.manual_seed(int(self.cfg.seed) * 100000 + round_num * 1000 + client_id + 17)
-        return generator
-
-    def _build_client_weights(self, selected_sizes: List[int]) -> List[float]:
-        if str(self.cfg.server.aggregation_weight_strategy) == "equal":
-            return [1.0 / max(1, len(selected_sizes)) for _ in selected_sizes]
-        total_selected = sum(selected_sizes)
-        if total_selected <= 0:
-            return [1.0 / max(1, len(selected_sizes)) for _ in selected_sizes]
-        return [size / total_selected for size in selected_sizes]
 
     def evaluate(self) -> Dict[str, float]:
         return self.server.evaluate(self.test_loader)
@@ -274,8 +274,9 @@ class FLTrainer:
                     f"Loss={test_metrics['loss']:.4f} | "
                     f"Clip={train_metrics.get('new_clip', 0.0):.4f} | "
                     f"Upload={train_metrics.get('avg_upload_ratio', 1.0):.2%} | "
+                    f"clip_snr_proxy={train_metrics.get('clip_snr_proxy', 0.0):.4f} | "
                     f"signal={train_metrics.get('signal_l2_norm', 0.0):.4f} | "
-                    f"noise={train_metrics.get('expected_noise_l2_norm', 0.0):.4f} | "
+                    f"expected_noise={train_metrics.get('expected_noise_l2_norm', 0.0):.4f} | "
                     f"SNR={train_metrics.get('snr_signal_to_noise', 0.0):.4f}"
                 )
                 if self.privacy_engine.is_enabled():
@@ -307,12 +308,7 @@ class FLTrainer:
             "total_rounds": float(len(self.history.rounds)),
         }
 
-    def _save_checkpoint(
-        self,
-        round_num: int,
-        is_best: bool = False,
-        is_final: bool = False,
-    ) -> None:
+    def _save_checkpoint(self, round_num: int, is_best: bool = False, is_final: bool = False) -> None:
         checkpoint = {
             "round": round_num,
             "model_state_dict": self.server.global_model.state_dict(),
@@ -326,14 +322,13 @@ class FLTrainer:
             path = os.path.join(str(self.cfg.trainer.save_dir), "final_model.pt")
         else:
             path = os.path.join(str(self.cfg.trainer.save_dir), f"checkpoint_round_{round_num}.pt")
-
         torch.save(checkpoint, path)
 
     def _save_history(self) -> None:
         history_data = {
             "rounds": self.history.rounds,
-            "test_accuracy": [m["accuracy"] for m in self.history.test_metrics],
-            "test_loss": [m["loss"] for m in self.history.test_metrics],
+            "test_accuracy": [metric["accuracy"] for metric in self.history.test_metrics],
+            "test_loss": [metric["loss"] for metric in self.history.test_metrics],
             "clip_history": self.history.clip_history,
             "privacy_spent": self.history.privacy_spent,
             "upload_ratio": self.history.upload_ratio,
@@ -364,14 +359,13 @@ class FLTrainer:
             "history": history_data,
         }
 
-        os.makedirs(str(self.cfg.trainer.log_dir), exist_ok=True)
         record_path = os.path.join(str(self.cfg.trainer.log_dir), "experiment_record.json")
-        with open(record_path, "w", encoding="utf-8") as f:
-            json.dump(full_record, f, indent=2, ensure_ascii=False)
+        with open(record_path, "w", encoding="utf-8") as handle:
+            json.dump(full_record, handle, indent=2, ensure_ascii=False)
 
         history_path = os.path.join(str(self.cfg.trainer.log_dir), "history.json")
-        with open(history_path, "w", encoding="utf-8") as f:
-            json.dump(history_data, f, indent=2, ensure_ascii=False)
+        with open(history_path, "w", encoding="utf-8") as handle:
+            json.dump(history_data, handle, indent=2, ensure_ascii=False)
 
 
 def copy_to_cpu(tensors):
@@ -392,17 +386,20 @@ def load_config(argv: List[str]) -> DictConfig:
         cfg.compressor.topk_ratio = 1.0
     if experiment_name == "fedavg":
         cfg.dp.enabled = False
-    if experiment_name == "dp_fedavg":
+        cfg.dp.use_heterogeneous_noise = False
         cfg.client.training_strategy = "standard"
+    elif experiment_name == "dp_fedavg":
+        cfg.dp.enabled = True
         cfg.dp.use_heterogeneous_noise = False
+        cfg.client.training_strategy = "standard"
         cfg.server.clip_update_method = "ema"
-        cfg.server.ema_alpha = 1.0
-    if experiment_name == "dp_fedsam":
+        cfg.server.ema_alpha = 0.8
+    elif experiment_name == "dp_fedsam":
+        cfg.dp.enabled = True
+        cfg.dp.use_heterogeneous_noise = False
         cfg.client.training_strategy = "dp_fedsam"
-        cfg.dp.use_heterogeneous_noise = False
         cfg.server.clip_update_method = "ema"
-        cfg.server.ema_alpha = 1.0
-
+        cfg.server.ema_alpha = 0.8
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     cfg.trainer.save_dir = f"./checkpoints/{experiment_name}_{timestamp}"
     cfg.trainer.log_dir = f"./logs/{experiment_name}_{timestamp}"
@@ -416,8 +413,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     trainer = FLTrainer(cfg)
     results = trainer.train()
     print("Final results:")
-    for k, v in results.items():
-        print(f"  {k}: {v}")
+    for key, value in results.items():
+        print(f"  {key}: {value}")
 
 
 if __name__ == "__main__":

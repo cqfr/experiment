@@ -2,10 +2,9 @@ from __future__ import annotations
 
 """Training, compression, clipping, and privacy strategies."""
 
-import copy
 import math
 from dataclasses import dataclass
-from typing import Dict, Optional, Protocol, Tuple
+from typing import Dict, Optional, Protocol, Sequence
 
 import torch
 import torch.nn as nn
@@ -14,9 +13,9 @@ from torch.utils.data import DataLoader
 
 from compression.topk import (
     ResidualAccumulator,
+    compress_gradient,
     compute_fisher_information,
     compute_importance_grad_normalized,
-    compress_gradient,
 )
 from dp.noise import (
     RDPAccountant,
@@ -73,6 +72,35 @@ class LocalTrainer(Protocol):
         ...
 
 
+class Compressor(Protocol):
+    def move_state_to(self, device: torch.device) -> None:
+        ...
+
+    def move_state_to_cpu(self) -> None:
+        ...
+
+    def compress(
+        self,
+        delta_w: TensorDict,
+        model: nn.Module,
+        dataloader: DataLoader,
+        device: torch.device,
+        return_importance_snapshot: bool = False,
+        importance_max_elements: int = 4096,
+    ) -> CompressionResult:
+        ...
+
+
+class AdaptiveClipper(Protocol):
+    def clip(
+        self,
+        delta_w: TensorDict,
+        clip_norm: float,
+        clip_weights: Optional[TensorDict] = None,
+    ) -> ClipResult:
+        ...
+
+
 class _BaseTrainer:
     def __init__(self, cfg) -> None:
         self.cfg = cfg
@@ -85,17 +113,20 @@ class _BaseTrainer:
             weight_decay=float(self.cfg.weight_decay),
         )
 
-    def _criterion(self) -> nn.Module:
+    @staticmethod
+    def _criterion() -> nn.Module:
         return nn.CrossEntropyLoss()
 
-    def _init_weights(self, model: nn.Module) -> TensorDict:
-        return {k: v.detach().clone() for k, v in model.state_dict().items()}
+    @staticmethod
+    def _snapshot_weights(model: nn.Module) -> TensorDict:
+        return {name: tensor.detach().clone() for name, tensor in model.state_dict().items()}
 
-    def _delta_from_init(self, model: nn.Module, init_weights: TensorDict) -> TensorDict:
+    @staticmethod
+    def _delta_from_init(model: nn.Module, init_weights: TensorDict) -> TensorDict:
         delta_w: TensorDict = {}
         for name, param in model.named_parameters():
             if param.requires_grad:
-                delta_w[name] = param.data - init_weights[name]
+                delta_w[name] = param.detach() - init_weights[name]
         return delta_w
 
     def should_store_old_weights(self) -> bool:
@@ -119,7 +150,7 @@ class StandardTrainer(_BaseTrainer):
         model.train()
         optimizer = self._optimizer(model)
         criterion = self._criterion()
-        init_weights = self._init_weights(model)
+        init_weights = self._snapshot_weights(model)
 
         for _ in range(int(self.cfg.local_epochs)):
             for data, target in dataloader:
@@ -153,21 +184,22 @@ class ContrastiveTrainer(_BaseTrainer):
         model.train()
         optimizer = self._optimizer(model)
         criterion = self._criterion()
-        init_weights = self._init_weights(model)
+        init_weights = self._snapshot_weights(model)
 
         for _ in range(int(self.cfg.local_epochs)):
             for data, target in dataloader:
                 data = data.to(device, non_blocking=True)
                 target = target.to(device, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
-                loss = criterion(model(data), target)
-                loss = loss + self._regularization_loss(model, global_weights, old_local_weights, device)
+                logits = model(data)
+                loss = criterion(logits, target)
+                loss = loss + self._contrastive_regularization(model, global_weights, old_local_weights, device)
                 loss.backward()
                 optimizer.step()
 
         return self._delta_from_init(model, init_weights)
 
-    def _regularization_loss(
+    def _contrastive_regularization(
         self,
         model: nn.Module,
         global_weights: Optional[TensorDict],
@@ -181,12 +213,10 @@ class ContrastiveTrainer(_BaseTrainer):
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
-            if name in global_weights:
-                diff_global = param - global_weights[name]
-                reg = reg + float(self.cfg.alpha) * diff_global.pow(2).sum()
+            diff_global = param - global_weights[name]
+            reg = reg + float(self.cfg.alpha) * diff_global.pow(2).sum()
             if old_local_weights is not None and name in old_local_weights:
-                diff_old = param - old_local_weights[name]
-                distance = torch.norm(diff_old, p=2)
+                distance = torch.norm(param - old_local_weights[name], p=2)
                 hinge = torch.relu(float(self.cfg.contrastive_margin) - distance)
                 reg = reg + float(self.cfg.beta) * hinge.pow(2)
         return reg
@@ -209,21 +239,22 @@ class FedProxTrainer(_BaseTrainer):
         model.train()
         optimizer = self._optimizer(model)
         criterion = self._criterion()
-        init_weights = self._init_weights(model)
+        init_weights = self._snapshot_weights(model)
 
         for _ in range(int(self.cfg.local_epochs)):
             for data, target in dataloader:
                 data = data.to(device, non_blocking=True)
                 target = target.to(device, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
-                loss = criterion(model(data), target)
-                loss = loss + self._prox_loss(model, global_weights, device)
+                logits = model(data)
+                loss = criterion(logits, target)
+                loss = loss + self._proximal_penalty(model, global_weights, device)
                 loss.backward()
                 optimizer.step()
 
         return self._delta_from_init(model, init_weights)
 
-    def _prox_loss(
+    def _proximal_penalty(
         self,
         model: nn.Module,
         global_weights: Optional[TensorDict],
@@ -231,11 +262,11 @@ class FedProxTrainer(_BaseTrainer):
     ) -> torch.Tensor:
         if global_weights is None:
             return torch.tensor(0.0, device=device)
+
         reg = torch.tensor(0.0, device=device)
         for name, param in model.named_parameters():
-            if param.requires_grad and name in global_weights:
-                diff = param - global_weights[name]
-                reg = reg + float(self.cfg.mu) * diff.pow(2).sum()
+            if param.requires_grad:
+                reg = reg + float(self.cfg.mu) * (param - global_weights[name]).pow(2).sum()
         return reg
 
 
@@ -253,7 +284,7 @@ class DPFedSAMTrainer(_BaseTrainer):
         model.train()
         optimizer = self._optimizer(model)
         criterion = self._criterion()
-        init_weights = self._init_weights(model)
+        init_weights = self._snapshot_weights(model)
 
         for _ in range(int(self.cfg.local_epochs)):
             for data, target in dataloader:
@@ -266,6 +297,7 @@ class DPFedSAMTrainer(_BaseTrainer):
 
                 grad_norm = self._grad_l2_norm(model, device)
                 scale = float(self.cfg.sam_rho) / (grad_norm + float(self.cfg.sam_eps))
+
                 perturbations = []
                 with torch.no_grad():
                     for param in model.parameters():
@@ -277,13 +309,14 @@ class DPFedSAMTrainer(_BaseTrainer):
                         perturbations.append(e_w)
 
                 optimizer.zero_grad(set_to_none=True)
-                loss_perturbed = criterion(model(data), target)
-                loss_perturbed.backward()
+                perturbed_loss = criterion(model(data), target)
+                perturbed_loss.backward()
 
                 with torch.no_grad():
                     for param, e_w in zip(model.parameters(), perturbations):
                         if e_w is not None:
                             param.sub_(e_w)
+
                 optimizer.step()
 
         return self._delta_from_init(model, init_weights)
@@ -294,25 +327,6 @@ class DPFedSAMTrainer(_BaseTrainer):
         if not norms:
             return torch.tensor(0.0, device=device)
         return torch.norm(torch.stack(norms), p=2)
-
-
-class Compressor(Protocol):
-    def move_state_to(self, device: torch.device) -> None:
-        ...
-
-    def move_state_to_cpu(self) -> None:
-        ...
-
-    def compress(
-        self,
-        delta_w: TensorDict,
-        model: nn.Module,
-        dataloader: DataLoader,
-        device: torch.device,
-        return_importance_snapshot: bool = False,
-        importance_max_elements: int = 4096,
-    ) -> CompressionResult:
-        ...
 
 
 class IdentityCompressor:
@@ -344,18 +358,18 @@ class TopKCompressor:
     def move_state_to(self, device: torch.device) -> None:
         if self.residual_accumulator.residual:
             self.residual_accumulator.residual = {
-                k: v.to(device) for k, v in self.residual_accumulator.residual.items()
+                name: tensor.to(device) for name, tensor in self.residual_accumulator.residual.items()
             }
         if self.fisher_cache is not None:
-            self.fisher_cache = {k: v.to(device) for k, v in self.fisher_cache.items()}
+            self.fisher_cache = {name: tensor.to(device) for name, tensor in self.fisher_cache.items()}
 
     def move_state_to_cpu(self) -> None:
         if self.residual_accumulator.residual:
             self.residual_accumulator.residual = {
-                k: v.detach().cpu() for k, v in self.residual_accumulator.residual.items()
+                name: tensor.detach().cpu() for name, tensor in self.residual_accumulator.residual.items()
             }
         if self.fisher_cache is not None:
-            self.fisher_cache = {k: v.detach().cpu() for k, v in self.fisher_cache.items()}
+            self.fisher_cache = {name: tensor.detach().cpu() for name, tensor in self.fisher_cache.items()}
 
     def compress(
         self,
@@ -384,8 +398,8 @@ class TopKCompressor:
         if bool(self.cfg.use_residual):
             self.residual_accumulator.update(working_delta, masks)
 
-        total_params = sum(v.numel() for v in masks.values())
-        kept_params = sum(v.sum().item() for v in masks.values())
+        total_params = sum(mask.numel() for mask in masks.values())
+        kept_params = sum(mask.sum().item() for mask in masks.values())
         upload_ratio = float(kept_params / total_params) if total_params > 0 else 1.0
 
         importance_vector = None
@@ -415,11 +429,11 @@ class TopKCompressor:
             if self.fisher_cache is None:
                 self.fisher_cache = compute_fisher_information(model, dataloader, device)
             return {
-                name: self.fisher_cache.get(name, torch.ones_like(d)).to(d.device) * d.abs()
-                for name, d in delta_w.items()
+                name: self.fisher_cache.get(name, torch.ones_like(tensor)).to(tensor.device) * tensor.abs()
+                for name, tensor in delta_w.items()
             }
         if strategy == "grad_squared":
-            return {name: d.abs() * d.abs() for name, d in delta_w.items()}
+            return {name: tensor.abs().pow(2) for name, tensor in delta_w.items()}
         return compute_importance_grad_normalized(delta_w)
 
 
@@ -431,12 +445,12 @@ class StandardL2Clipper:
         clip_weights: Optional[TensorDict] = None,
     ) -> ClipResult:
         del clip_weights
-        total_norm_sq = sum(d.pow(2).sum() for d in delta_w.values())
-        total_norm = total_norm_sq.sqrt().item()
+        total_norm_sq = sum(tensor.float().pow(2).sum() for tensor in delta_w.values())
+        total_norm = float(torch.sqrt(total_norm_sq).item()) if delta_w else 0.0
         clipped = total_norm > clip_norm
         if clipped:
             scale = clip_norm / max(total_norm, 1e-12)
-            delta_w = {name: d * scale for name, d in delta_w.items()}
+            delta_w = {name: tensor * scale for name, tensor in delta_w.items()}
         return ClipResult(delta_w=delta_w, norm_value=total_norm, clipped=clipped)
 
 
@@ -456,25 +470,31 @@ class WeightedL2Clipper:
                 raise KeyError(f"Missing clip weight template for parameter: {name}")
 
             weights = clip_weights[name].to(tensor.device).clamp_min(1e-6)
-            # 中文说明：
-            # 1. 带权裁剪计算的是 ||g||_{W^{-1}} = sqrt(sum_i (g_i / w_i)^2)。
-            # 2. 这里除以 w_i，等价于先把更新映射到“噪声归一化坐标系”里再算普通 L2 范数。
-            # 3. 当后续第 i 维高斯噪声标准差与 w_i 成比例时，这个范数对应的就是与噪声协方差匹配的椭球裁剪。
-            # 4. baseline 使用同方差噪声，噪声球是各向同性的，因此不需要这套椭球裁剪，直接标准 L2 即可。
+            # 数学解释：
+            # 1. 当不同参数维度在服务端将被施加不同标准差的高斯噪声时，
+            #    直接使用普通 L2 裁剪 ||g||_2 会把所有坐标当成同一个几何尺度，
+            #    这与异构噪声的真实敏感度几何不匹配。
+            # 2. 这里改用 ||g||_{W^{-1}} = sqrt(sum_i (g_i / w_i)^2)。
+            #    先除以 w_i，等价于把第 i 个坐标映射到“按噪声尺度标准化后的坐标系”。
+            #    w_i 越大，表示该坐标允许更大的有效振幅；w_i 越小，表示该坐标更敏感。
+            # 3. 因而裁剪集合不再是球，而是与噪声协方差对齐的椭球。
+            #    这样在进行对角异构噪声注入时，敏感度上界与噪声模板是匹配的。
+            # 4. baseline 的 FedAvg / DP-FedAvg / DP-FedSAM 默认使用同方差噪声，
+            #    协方差与单位阵成比例，不需要这套椭球裁剪，退化成标准 L2 即可。
             norm_terms.append(((tensor / weights) ** 2).sum())
 
-        weighted_norm = torch.stack(norm_terms).sum().sqrt().item() if norm_terms else 0.0
+        weighted_norm = float(torch.sqrt(torch.stack(norm_terms).sum()).item()) if norm_terms else 0.0
         clipped = weighted_norm > clip_norm
         if clipped:
             scale = clip_norm / max(weighted_norm, 1e-12)
-            delta_w = {name: d * scale for name, d in delta_w.items()}
+            delta_w = {name: tensor * scale for name, tensor in delta_w.items()}
         return ClipResult(delta_w=delta_w, norm_value=weighted_norm, clipped=clipped)
 
 
 class PrivacyEngine:
     def __init__(self, dp_cfg, num_rounds: int) -> None:
         self.dp_cfg = dp_cfg
-        self.accountant = None
+        self.accountant: Optional[RDPAccountant] = None
         if bool(dp_cfg.enabled):
             self.accountant = RDPAccountant(
                 epsilon_total=float(dp_cfg.epsilon_total),
@@ -491,7 +511,7 @@ class PrivacyEngine:
 
     def calibrate_round(
         self,
-        client_weights,
+        client_weights: Sequence[float],
         clip_norm: float,
         sampling_rate: float,
         compressor_ratio: float = 1.0,
@@ -514,7 +534,7 @@ class PrivacyEngine:
             steps=int(self.dp_cfg.rdp_steps_per_round),
         )
         sensitivity_l2 = compute_weighted_sensitivity(client_weights=client_weights, clip_norm=clip_norm)
-        sigma_agg = noise_multiplier * sensitivity_l2
+        sigma_agg = float(noise_multiplier) * float(sensitivity_l2)
         clip_snr_proxy = float(clip_norm / max(sigma_agg, 1e-12)) if sigma_agg > 0 else 0.0
 
         return PrivacyRoundState(
@@ -549,7 +569,7 @@ class PrivacyEngine:
         generator: Optional[torch.Generator] = None,
     ) -> TensorDict:
         if sigma_agg <= 0:
-            return global_update
+            return clone_tensor_dict(global_update)
 
         if not use_heterogeneous_noise:
             return {
@@ -565,27 +585,28 @@ class PrivacyEngine:
         slices = []
         offset = 0
         for name, tensor in global_update.items():
-            flat_tensor = tensor.flatten()
-            flat_scale = clip_weight_template[name].to(tensor.device).flatten()
-            flat_update.append(flat_tensor)
-            flat_scales.append(flat_scale)
-            slices.append((name, offset, offset + flat_tensor.numel(), tensor.shape))
-            offset += flat_tensor.numel()
+            if name not in clip_weight_template:
+                raise KeyError(f"Missing heterogeneous noise scale for parameter: {name}")
+            flattened = tensor.reshape(-1)
+            scale = clip_weight_template[name].to(tensor.device).reshape(-1)
+            flat_update.append(flattened)
+            flat_scales.append(scale)
+            slices.append((name, offset, offset + flattened.numel(), tensor.shape))
+            offset += flattened.numel()
 
-        merged_update = torch.cat(flat_update)
-        merged_scales = torch.cat(flat_scales)
-        mask = torch.ones_like(merged_update)
-        noisy_update_flat, _ = add_heterogeneous_noise(
+        merged_update = torch.cat(flat_update, dim=0)
+        merged_scales = torch.cat(flat_scales, dim=0)
+        noisy_flat, _ = add_heterogeneous_noise(
             tensor=merged_update,
             sigma_base=sigma_agg,
             relative_scales=merged_scales,
-            mask=mask,
+            mask=torch.ones_like(merged_update),
             generator=generator,
         )
 
         noisy_update: TensorDict = {}
         for name, start, end, shape in slices:
-            noisy_update[name] = noisy_update_flat[start:end].reshape(shape)
+            noisy_update[name] = noisy_flat[start:end].reshape(shape)
         return noisy_update
 
 
@@ -611,14 +632,14 @@ def build_compressor(compressor_cfg) -> Compressor:
     raise ValueError(f"Unknown compressor type: {compressor_type}")
 
 
-def build_clipper(use_weighted: bool):
+def build_clipper(use_weighted: bool) -> AdaptiveClipper:
     return WeightedL2Clipper() if use_weighted else StandardL2Clipper()
 
 
 def build_vector_snapshot(tensors: TensorDict, max_elements: int = 4096) -> torch.Tensor:
     if not tensors:
         return torch.zeros(1)
-    flat = torch.cat([tensor.detach().float().flatten().cpu() for tensor in tensors.values()])
+    flat = torch.cat([tensor.detach().float().reshape(-1).cpu() for tensor in tensors.values()], dim=0)
     if flat.numel() <= max_elements:
         return flat
     idx = torch.linspace(0, flat.numel() - 1, steps=max_elements).long()
@@ -628,4 +649,4 @@ def build_vector_snapshot(tensors: TensorDict, max_elements: int = 4096) -> torc
 def clone_tensor_dict(tensors: Optional[TensorDict]) -> Optional[TensorDict]:
     if tensors is None:
         return None
-    return {k: v.detach().clone() for k, v in tensors.items()}
+    return {name: tensor.detach().clone() for name, tensor in tensors.items()}

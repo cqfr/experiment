@@ -8,41 +8,44 @@ import torch.nn as nn
 
 def _group_norm(num_channels: int) -> nn.GroupNorm:
     num_groups = min(8, num_channels)
-    while num_channels % num_groups != 0 and num_groups > 1:
+    while num_groups > 1 and num_channels % num_groups != 0:
         num_groups -= 1
     return nn.GroupNorm(num_groups=num_groups, num_channels=num_channels)
 
 
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False),
+            _group_norm(out_channels),
+            nn.ReLU(inplace=False),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False),
+            _group_norm(out_channels),
+            nn.ReLU(inplace=False),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
 class SimpleCNN(nn.Module):
-    """A compact GroupNorm CNN with fewer than 500k parameters."""
+    """A compact CIFAR-10 CNN with GroupNorm and fewer than 500k parameters."""
 
     def __init__(self, num_classes: int = 10) -> None:
         super().__init__()
-
         self.features = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1, bias=False),
-            _group_norm(32),
-            nn.ReLU(inplace=False),
-            nn.MaxPool2d(kernel_size=2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),
-            _group_norm(64),
-            nn.ReLU(inplace=False),
-            nn.MaxPool2d(kernel_size=2),
+            ConvBlock(3, 48),
+            ConvBlock(48, 96),
         )
-
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(64 * 8 * 8, 96),
+            nn.Linear(96 * 8 * 8, 48),
             nn.ReLU(inplace=False),
-            nn.Linear(96, num_classes),
+            nn.Linear(48, num_classes),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.features(x)
         return self.classifier(x)
-
-
-if __name__ == "__main__":
-    model = SimpleCNN(num_classes=10)
-    params = sum(p.numel() for p in model.parameters())
-    print(f"params={params}")
