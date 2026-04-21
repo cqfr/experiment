@@ -21,7 +21,12 @@ data:
 trainer:
   num_rounds: 100
   max_workers: 8
+  num_workers: 0
+  persistent_workers: false
   device: auto
+  keep_client_model_on_device: true
+  min_cuda_free_ratio: 0.15
+  cuda_empty_cache_each_round: false
   log_interval: 1
   save_interval: 10
   save_dir: ./checkpoints
@@ -54,7 +59,7 @@ server:
   aggregation_weight_strategy: data_size
   initial_clip: 1.0
   clip_update_method: adaptive
-  target_quantile: 0.9
+  target_quantile: 0.7
   clip_lr: 0.2
   ema_alpha: 0.8
 
@@ -62,10 +67,23 @@ dp:
   enabled: true
   epsilon_total: 8.0
   delta: 1.0e-5
+  clip_count_noise_multiplier: 0.1
   use_heterogeneous_noise: true
   min_relative_noise: 0.3
   max_relative_noise: 3.0
   template_ema: 0.9
+  use_global_importance_for_topk: true
+  importance_aggregation: tempered_weighted
+  importance_weight_beta: 0.5
+  importance_normalization: mean
+  global_local_mix_lambda: 0.4
+  enable_importance_freeze: true
+  importance_freeze_warmup_rounds: 10
+  importance_freeze_threshold: 0.001
+  importance_freeze_patience: 3
+  local_importance_refresh_interval_after_freeze: 5
+  client_noise_allocation: uniform
+  client_variance_max_scale: 10.0
   account_for_topk_in_q: false
   rdp_orders: [2, 3, 4, 5, 8, 16, 32, 64, 128, 256]
   rdp_steps_per_round: 1

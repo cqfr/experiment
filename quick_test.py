@@ -1,6 +1,8 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 """Quick smoke tests for core modules."""
+
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
@@ -36,7 +38,6 @@ def test_dp_accountant() -> None:
 
 def test_client_server_round() -> None:
     from client.client import FLClient
-    from config import ClientConfig, DPConfig, ServerConfig
     from server.server import FLServer
 
     class TinyNet(nn.Module):
@@ -47,6 +48,63 @@ def test_client_server_round() -> None:
         def forward(self, x):
             return self.fc(x)
 
+    cfg = SimpleNamespace(
+        client=SimpleNamespace(
+            training_strategy="standard",
+            local_epochs=1,
+            lr=0.01,
+            momentum=0.0,
+            weight_decay=0.0,
+            alpha=0.0,
+            beta=0.0,
+            contrastive_margin=1.0,
+            mu=0.0,
+            sam_rho=0.05,
+            sam_eps=1e-12,
+            stat_type="l2_norm",
+        ),
+        compressor=SimpleNamespace(
+            type="identity",
+            importance_strategy="grad_normalized",
+            topk_strategy="weighted_layer_norm",
+            topk_ratio=1.0,
+            layer_weight_method="mean",
+            use_residual=False,
+        ),
+        dp=SimpleNamespace(
+            enabled=True,
+            use_heterogeneous_noise=False,
+            min_relative_noise=0.3,
+            max_relative_noise=3.0,
+            template_ema=0.9,
+            use_global_importance_for_topk=True,
+            importance_aggregation="tempered_weighted",
+            importance_weight_beta=0.5,
+            importance_normalization="mean",
+            global_local_mix_lambda=0.4,
+            enable_importance_freeze=True,
+            importance_freeze_warmup_rounds=10,
+            importance_freeze_threshold=1e-3,
+            importance_freeze_patience=3,
+            local_importance_refresh_interval_after_freeze=5,
+            clip_count_noise_multiplier=0.1,
+        ),
+        server=SimpleNamespace(
+            initial_clip=1.0,
+            server_lr=1.0,
+            aggregation_weight_strategy="data_size",
+            clip_update_method="adaptive",
+            target_quantile=0.7,
+            clip_lr=0.2,
+            ema_alpha=0.8,
+        ),
+        trainer=SimpleNamespace(
+            keep_client_model_on_device=False,
+            min_cuda_free_ratio=0.15,
+            cuda_empty_cache_each_round=False,
+        ),
+    )
+
     model = TinyNet()
     dataset = TensorDataset(torch.randn(64, 8), torch.randint(0, 4, (64,)))
     loader = DataLoader(dataset, batch_size=16, shuffle=True)
@@ -55,8 +113,7 @@ def test_client_server_round() -> None:
         client_id=0,
         model=model,
         dataloader=loader,
-        config=ClientConfig(),
-        dp_config=DPConfig(),
+        cfg=cfg,
         device=torch.device("cpu"),
     )
 
@@ -64,19 +121,15 @@ def test_client_server_round() -> None:
     update = client.train_and_upload(
         global_weights=global_weights,
         clip_norm=1.0,
-        sigma_base=0.1,
+        local_noise_std=0.1,
     )
 
     assert update.data_size == 64
     assert len(update.delta_w) > 0
 
-    server = FLServer(model=model, config=ServerConfig(), device=torch.device("cpu"))
-    agg = server.aggregate(
-        client_updates=[update.delta_w],
-        data_sizes=[update.data_size],
-        stats=[update.stat],
-    )
-    metrics = server.update_global_model(agg.global_update, agg.stats_aggregated)
+    server = FLServer(model=model, cfg=cfg, device=torch.device("cpu"))
+    agg = server.aggregate(client_updates=[update])
+    metrics = server.update_global_model(agg.noisy_update, agg.stats_aggregated)
     assert "new_clip" in metrics
 
 

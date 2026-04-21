@@ -3,12 +3,15 @@ from __future__ import annotations
 """Federated server implementation."""
 
 import copy
+import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
+
+from components.strategies import normalize_importance_dict
 
 TensorDict = Dict[str, torch.Tensor]
 
@@ -35,6 +38,11 @@ class FLServer:
         self.stats_history: List[Dict[str, float]] = []
         self.current_round = 0
 
+        self.global_importance_template: TensorDict = {
+            name: torch.ones_like(param.detach()).cpu()
+            for name, param in self.global_model.named_parameters()
+            if param.requires_grad
+        }
         self.clip_weight_template: TensorDict = {
             name: torch.ones_like(param.detach()).cpu()
             for name, param in self.global_model.named_parameters()
@@ -45,6 +53,9 @@ class FLServer:
             for name, param in self.global_model.named_parameters()
             if param.requires_grad
         }
+        self.importance_frozen = False
+        self.freeze_counter = 0
+        self.last_importance_distance = 0.0
 
     def get_global_weights(self) -> TensorDict:
         return copy.deepcopy(self.global_model.state_dict())
@@ -55,7 +66,23 @@ class FLServer:
     def get_clip_weight_template(self) -> TensorDict:
         return copy.deepcopy(self.clip_weight_template)
 
-    def aggregate(self, client_updates, noisy_update: TensorDict) -> AggregatedResult:
+    def get_global_importance_template(self) -> TensorDict:
+        return copy.deepcopy(self.global_importance_template)
+
+    def should_request_importance(self) -> bool:
+        # [MOD][阶段3] 冻结后不再强制 client 每轮上传 importance，降低通信与 server 端模板波动。
+        needs_global_template = bool(getattr(self.cfg.dp, "use_global_importance_for_topk", True)) or bool(
+            self.cfg.dp.use_heterogeneous_noise
+        )
+        return needs_global_template and not self.importance_frozen
+
+    def should_refresh_local_importance(self, round_num: int) -> bool:
+        if not self.importance_frozen:
+            return True
+        interval = max(1, int(getattr(self.cfg.dp, "local_importance_refresh_interval_after_freeze", 5)))
+        return round_num % interval == 0
+
+    def aggregate(self, client_updates) -> AggregatedResult:
         deltas = [update.delta_w for update in client_updates]
         data_sizes = [update.data_size for update in client_updates]
 
@@ -66,7 +93,8 @@ class FLServer:
 
         return AggregatedResult(
             clean_update=clean_update,
-            noisy_update=noisy_update,
+            # [MOD][阶段1] server 仅聚合 client 已带噪更新，不再进行第二次中心化加噪。
+            noisy_update={name: tensor.detach().clone() for name, tensor in clean_update.items()},
             stats_aggregated=stats_aggregated,
             signal_l2_norm=signal_l2_norm,
             total_params=total_params,
@@ -85,8 +113,11 @@ class FLServer:
 
         old_clip = self.clip_norm
         self._update_clip_norm(stats_aggregated)
-        if aggregated_importance is not None and bool(self.cfg.dp.use_heterogeneous_noise):
-            self._update_clip_weight_template(aggregated_importance)
+        needs_global_template = bool(getattr(self.cfg.dp, "use_global_importance_for_topk", True)) or bool(
+            self.cfg.dp.use_heterogeneous_noise
+        )
+        if aggregated_importance is not None and needs_global_template:
+            self._update_importance_templates(aggregated_importance)
 
         self.current_round += 1
         self.stats_history.append(stats_aggregated)
@@ -98,6 +129,10 @@ class FLServer:
             "new_clip": float(self.clip_norm),
             "stats_median": float(stats_aggregated.get("median", 0.0)),
             "fraction_clipped": float(stats_aggregated.get("fraction_clipped", 0.0)),
+            "fraction_unclipped": float(stats_aggregated.get("fraction_unclipped", 0.0)),
+            "noisy_unclipped_quantile": float(stats_aggregated.get("noisy_unclipped_quantile", 0.0)),
+            "importance_frozen": 1.0 if self.importance_frozen else 0.0,
+            "importance_distance": float(self.last_importance_distance),
         }
 
     def evaluate(self, test_loader: torch.utils.data.DataLoader) -> Dict[str, float]:
@@ -128,15 +163,41 @@ class FLServer:
         }
 
     def aggregate_importance(self, client_updates) -> Optional[TensorDict]:
-        importance_updates = [update.importance_dict for update in client_updates if update.importance_dict is not None]
-        if not importance_updates:
+        importance_payloads = [
+            (update.importance_dict, update.data_size)
+            for update in client_updates
+            if update.importance_dict is not None
+        ]
+        if not importance_payloads:
             return None
 
+        method = str(getattr(self.cfg.dp, "importance_aggregation", "tempered_weighted"))
+        beta = float(getattr(self.cfg.dp, "importance_weight_beta", 0.5))
+        if method == "mean":
+            weights = [1.0 / len(importance_payloads) for _ in importance_payloads]
+        else:
+            if method == "weighted":
+                exponent = 1.0
+            elif method == "tempered_weighted":
+                exponent = beta
+            else:
+                raise ValueError(f"Unknown importance aggregation method: {method}")
+            raw_weights = [max(float(data_size), 1.0) ** exponent for _, data_size in importance_payloads]
+            total_weight = sum(raw_weights)
+            weights = [weight / max(total_weight, 1e-12) for weight in raw_weights]
+
         aggregated: TensorDict = {}
-        for name in importance_updates[0].keys():
-            tensors = [importance[name].float() for importance in importance_updates if name in importance]
-            if tensors:
-                aggregated[name] = torch.stack(tensors, dim=0).mean(dim=0)
+        template_keys = self.global_importance_template.keys()
+        for name in template_keys:
+            acc = None
+            for (importance_dict, _), weight in zip(importance_payloads, weights):
+                if name not in importance_dict:
+                    continue
+                normalized = self._normalize_importance_tensor(importance_dict[name])
+                weighted_term = normalized * float(weight)
+                acc = weighted_term.clone() if acc is None else acc + weighted_term
+            if acc is not None:
+                aggregated[name] = acc.cpu()
         return aggregated if aggregated else None
 
     def _weighted_aggregate(self, client_updates: List[TensorDict], data_sizes: List[int]) -> TensorDict:
@@ -167,11 +228,11 @@ class FLServer:
     def _update_clip_norm(self, stats: Dict[str, float]) -> None:
         method = str(self.cfg.server.clip_update_method)
         if method == "adaptive":
-            fraction_clipped = float(stats.get("fraction_clipped", 0.0))
-            if fraction_clipped > float(self.cfg.server.target_quantile):
-                self.clip_norm *= 1.0 + float(self.cfg.server.clip_lr)
-            else:
-                self.clip_norm *= 1.0 - float(self.cfg.server.clip_lr)
+            # [MOD][阶段1] Andrew et al. (2019): C_{t+1} = C_t * exp(-eta_c * (q_hat_t - gamma)).
+            noisy_unclipped_quantile = float(stats.get("noisy_unclipped_quantile", 0.0))
+            target_quantile = float(self.cfg.server.target_quantile)
+            clip_lr = float(self.cfg.server.clip_lr)
+            self.clip_norm *= math.exp(-clip_lr * (noisy_unclipped_quantile - target_quantile))
         elif method == "ema":
             median = float(stats.get("median", self.clip_norm))
             alpha = float(self.cfg.server.ema_alpha)
@@ -186,39 +247,95 @@ class FLServer:
                 "q25": 0.0,
                 "q75": 0.0,
                 "count": 0.0,
+                "unclipped_count": 0.0,
+                "fraction_unclipped": 0.0,
                 "fraction_clipped": 0.0,
+                "noisy_unclipped_quantile": 0.0,
             }
 
         norms = np.array([float(update.stat) for update in client_updates], dtype=np.float64)
         clipped_flags = np.array([1.0 if update.clipped else 0.0 for update in client_updates], dtype=np.float64)
+        unclipped_flags = 1.0 - clipped_flags
+
+        count = float(norms.size)
+        unclipped_count = float(unclipped_flags.sum())
+
+        clip_count_noise_multiplier = float(getattr(self.cfg.dp, "clip_count_noise_multiplier", 0.1))
+        noisy_unclipped_quantile = float(
+            np.clip(
+                (unclipped_count + np.random.normal(loc=0.0, scale=clip_count_noise_multiplier)) / max(count, 1.0),
+                0.0,
+                1.0,
+            )
+        )
+
         return {
             "median": float(np.quantile(norms, 0.5)),
             "q25": float(np.quantile(norms, 0.25)),
             "q75": float(np.quantile(norms, 0.75)),
-            "count": float(norms.size),
+            "count": count,
+            "unclipped_count": unclipped_count,
+            "fraction_unclipped": float(unclipped_flags.mean()),
             "fraction_clipped": float(clipped_flags.mean()),
+            "noisy_unclipped_quantile": noisy_unclipped_quantile,
         }
 
-    def _update_clip_weight_template(self, aggregated_importance: TensorDict) -> None:
+    def _update_importance_templates(self, aggregated_importance: TensorDict) -> None:
+        prev_template = copy.deepcopy(self.global_importance_template)
         alpha = float(self.cfg.dp.template_ema)
         updated_importance_ema: TensorDict = {}
+        updated_global_template: TensorDict = {}
         updated_clip_template: TensorDict = {}
 
-        for name, current_template in self.clip_weight_template.items():
+        for name, current_template in self.global_importance_template.items():
             public_importance = aggregated_importance.get(name)
             if public_importance is None:
                 updated_importance_ema[name] = self.importance_ema_template[name]
-                updated_clip_template[name] = current_template
+                updated_global_template[name] = current_template
+                updated_clip_template[name] = self.clip_weight_template[name]
                 continue
 
-            sanitized_importance = torch.nan_to_num(public_importance.detach().float().abs(), nan=0.0, posinf=0.0, neginf=0.0).cpu()
+            sanitized_importance = self._normalize_importance_tensor(public_importance).cpu()
             prev_ema = self.importance_ema_template[name]
             next_ema = alpha * prev_ema + (1.0 - alpha) * sanitized_importance
             updated_importance_ema[name] = next_ema
+            updated_global_template[name] = next_ema.cpu()
             updated_clip_template[name] = self._importance_to_template(next_ema)
 
-        self.importance_ema_template = updated_importance_ema
-        self.clip_weight_template = updated_clip_template
+        candidate_distance = self._template_distance(prev_template, updated_global_template)
+        self.last_importance_distance = candidate_distance
+
+        if not self.importance_frozen:
+            self.global_importance_template = updated_global_template
+            self.clip_weight_template = updated_clip_template
+            self.importance_ema_template = updated_importance_ema
+            self._maybe_freeze(updated_global_template, candidate_distance)
+
+    def _maybe_freeze(self, candidate_template: TensorDict, distance: float) -> None:
+        del candidate_template
+        if not bool(getattr(self.cfg.dp, "enable_importance_freeze", False)):
+            return
+
+        warmup_rounds = int(getattr(self.cfg.dp, "importance_freeze_warmup_rounds", 10))
+        threshold = float(getattr(self.cfg.dp, "importance_freeze_threshold", 1e-3))
+        patience = int(getattr(self.cfg.dp, "importance_freeze_patience", 3))
+
+        if self.current_round < warmup_rounds:
+            self.freeze_counter = 0
+            return
+
+        if distance < threshold:
+            self.freeze_counter += 1
+        else:
+            self.freeze_counter = 0
+
+        if self.freeze_counter >= patience:
+            # [MOD][阶段3] 一旦全局 importance 模板稳定，就冻结，后续不再每轮更新和索取 importance。
+            self.importance_frozen = True
+
+    def _normalize_importance_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        normalized = normalize_importance_dict({"tmp": tensor})["tmp"]
+        return normalized
 
     def _importance_to_template(self, importance: torch.Tensor) -> torch.Tensor:
         if importance.numel() == 0:
@@ -237,6 +354,22 @@ class FLServer:
         )
         rms = torch.sqrt(torch.mean(clipped.pow(2))).clamp_min(1e-6)
         return (clipped / rms).cpu()
+
+    def _template_distance(self, previous: TensorDict, current: TensorDict) -> float:
+        numerator_terms = []
+        denominator_terms = []
+        for name in previous.keys():
+            if name not in current:
+                continue
+            prev = previous[name].float()
+            cur = current[name].float()
+            numerator_terms.append((cur - prev).pow(2).sum())
+            denominator_terms.append(prev.pow(2).sum())
+        if not numerator_terms:
+            return 0.0
+        numerator = torch.sqrt(torch.stack(numerator_terms).sum())
+        denominator = torch.sqrt(torch.stack(denominator_terms).sum()).clamp_min(1e-6)
+        return float((numerator / denominator).item())
 
     @staticmethod
     def _l2_norm(tensors: TensorDict) -> float:

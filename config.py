@@ -118,7 +118,7 @@ class ServerConfig:
 
     initial_clip: float = 1.0
     clip_update_method: ClipUpdateMethod = ClipUpdateMethod.ADAPTIVE
-    target_quantile: float = 0.9
+    target_quantile: float = 0.7
     clip_lr: float = 0.2
     ema_alpha: float = 0.8
 
@@ -138,6 +138,19 @@ class DPConfig:
     use_heterogeneous_noise: bool = True
     min_relative_noise: float = 0.3
     max_relative_noise: float = 3.0
+    template_ema: float = 0.9
+    # [MOD][阶段2] 全局 importance 作为 top-k 的公共 prior，本地 importance 作为 correction。
+    use_global_importance_for_topk: bool = True
+    importance_aggregation: Literal["mean", "weighted", "tempered_weighted"] = "tempered_weighted"
+    importance_weight_beta: float = 0.5
+    importance_normalization: Literal["mean"] = "mean"
+    global_local_mix_lambda: float = 0.4
+    # [MOD][阶段3] 模板稳定后冻结全局 prior，并低频刷新本地 importance。
+    enable_importance_freeze: bool = True
+    importance_freeze_warmup_rounds: int = 10
+    importance_freeze_threshold: float = 1e-3
+    importance_freeze_patience: int = 3
+    local_importance_refresh_interval_after_freeze: int = 5
     relative_noise_mode: Literal["inverse_power", "linear"] = "inverse_power"
     relative_noise_alpha: float = 1.0
     relative_noise_eps: float = 1e-6
@@ -174,6 +187,9 @@ class DPConfig:
     # Explicit modeling assumption accepted by the user.
     trusted_server_for_stats: bool = True
 
+    # Andrew et al. (2019) adaptive clipping noise for the unclipped-count statistic.
+    clip_count_noise_multiplier: float = 0.1
+
 
 @dataclass
 class ExperimentConfig:
@@ -202,6 +218,10 @@ class ExperimentConfig:
     save_dir: str = "./checkpoints"
     log_dir: str = "./logs"
 
+    keep_client_model_on_device: bool = True
+    cuda_empty_cache_each_round: bool = False
+    min_cuda_free_ratio: float = 0.15
+
     # Optional importance visualization (off by default)
     importance_viz_enabled: bool = False
     importance_viz_interval: int = 10
@@ -217,6 +237,10 @@ def get_fedavg_config() -> ExperimentConfig:
     config.client.topk_ratio = 1.0
     config.client.use_residual = False
     config.dp.enabled = False
+    config.dp.use_heterogeneous_noise = False
+    config.dp.use_global_importance_for_topk = False
+    config.dp.enable_importance_freeze = False
+    config.dp.global_local_mix_lambda = 0.0
     config.server.initial_clip = 1_000.0
     config.server.clip_update_method = ClipUpdateMethod.EMA
     config.server.ema_alpha = 1.0
@@ -236,6 +260,9 @@ def get_dp_fedavg_config(
     config.dp.enabled = True
     config.dp.epsilon_total = epsilon
     config.dp.use_heterogeneous_noise = False
+    config.dp.use_global_importance_for_topk = False
+    config.dp.enable_importance_freeze = False
+    config.dp.global_local_mix_lambda = 0.0
     config.dp.client_noise_allocation = "uniform"
     config.server.initial_clip = initial_clip
     config.server.clip_update_method = ClipUpdateMethod.EMA
@@ -266,6 +293,10 @@ def get_proposed_config(epsilon: float = 8.0) -> ExperimentConfig:
     config.dp.enabled = True
     config.dp.epsilon_total = epsilon
     config.dp.use_heterogeneous_noise = True
+    config.dp.importance_aggregation = "tempered_weighted"
+    config.dp.importance_weight_beta = 0.5
+    config.dp.global_local_mix_lambda = 0.4
+    config.dp.enable_importance_freeze = True
 
     config.server.clip_update_method = ClipUpdateMethod.ADAPTIVE
     return config

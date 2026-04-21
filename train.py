@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -21,6 +21,7 @@ from tqdm import tqdm
 from client.client import FLClient
 from components.strategies import PrivacyEngine
 from data.utils import get_dataloader
+from dp.noise import allocate_client_noise_stds
 from models import ResNet18, SimpleCNN
 from server.server import FLServer
 
@@ -60,6 +61,8 @@ class FLTrainer:
             data_dir=cfg.data.data_dir,
             min_samples_per_client=int(cfg.data.min_samples_per_client),
             split_max_attempts=int(cfg.data.split_max_attempts),
+            num_workers=int(getattr(cfg.trainer, "num_workers", 0)),
+            persistent_workers=bool(getattr(cfg.trainer, "persistent_workers", False)),
         )
 
         self.model = self._build_model().cpu()
@@ -116,6 +119,31 @@ class FLTrainer:
             return [1.0 / max(1, len(selected_sizes)) for _ in selected_sizes]
         return [size / total_selected for size in selected_sizes]
 
+    def _build_local_noise_stds(
+        self,
+        client_weights: Sequence[float],
+        privacy_state,
+        clip_norm: float,
+    ) -> List[float]:
+        if not self.privacy_engine.is_enabled():
+            return [0.0 for _ in client_weights]
+
+        if str(self.cfg.server.aggregation_weight_strategy) == "equal":
+            local_std = PrivacyEngine.compute_local_noise_std(
+                clip_norm=clip_norm,
+                noise_multiplier=privacy_state.noise_multiplier,
+                num_selected_clients=len(client_weights),
+            )
+            return [local_std for _ in client_weights]
+
+        # [MOD][阶段1] data_size 加权聚合时从目标聚合方差回推每个 client 的本地噪声，避免用等权公式错配。
+        return allocate_client_noise_stds(
+            client_weights=client_weights,
+            sigma_agg=float(privacy_state.sigma_agg),
+            strategy="uniform",
+            max_sigma_scale=float(getattr(self.cfg.dp, "client_variance_max_scale", 10.0)),
+        )
+
     def _need_viz(self, round_num: int, client_id: int) -> bool:
         return (
             bool(self.cfg.importance_viz.enabled)
@@ -132,6 +160,11 @@ class FLTrainer:
         clip_norm = self.server.get_clip_norm()
         use_heterogeneous_noise = bool(self.cfg.dp.enabled and self.cfg.dp.use_heterogeneous_noise)
         clip_weight_template = self.server.get_clip_weight_template() if use_heterogeneous_noise else None
+        global_importance_template = (
+            self.server.get_global_importance_template()
+            if bool(getattr(self.cfg.dp, "use_global_importance_for_topk", True))
+            else None
+        )
 
         selected_ids = self._select_clients(int(self.cfg.data.clients_per_round))
         selected_sizes = [self.clients[client_id].data_size for client_id in selected_ids]
@@ -145,6 +178,14 @@ class FLTrainer:
             sampling_rate=sampling_rate,
             compressor_ratio=compressor_ratio,
         )
+        local_noise_stds = self._build_local_noise_stds(
+            client_weights=client_weights,
+            privacy_state=privacy_state,
+            clip_norm=clip_norm,
+        )
+
+        need_importance_upload = self.server.should_request_importance()
+        force_refresh_local_importance = self.server.should_refresh_local_importance(round_num)
 
         global_weights = self.server.get_global_weights()
         client_updates = self._run_clients_parallel(
@@ -152,24 +193,16 @@ class FLTrainer:
             global_weights=global_weights,
             clip_norm=clip_norm,
             clip_weight_template=clip_weight_template,
+            global_importance_template=global_importance_template,
+            local_noise_stds=local_noise_stds,
+            need_importance_upload=need_importance_upload,
+            force_refresh_local_importance=force_refresh_local_importance,
             round_num=round_num,
         )
 
-        aggregated_importance = self.server.aggregate_importance(client_updates)
-        clean_update = self.server._weighted_aggregate(
-            [update.delta_w for update in client_updates],
-            [update.data_size for update in client_updates],
-        )
-
-        noisy_update = self.privacy_engine.add_server_noise(
-            global_update=clean_update,
-            sigma_agg=privacy_state.sigma_agg,
-            use_heterogeneous_noise=use_heterogeneous_noise,
-            clip_weight_template=clip_weight_template,
-            generator=self._make_generator(round_num=round_num, client_id=-1),
-        )
-
-        aggregated = self.server.aggregate(client_updates=client_updates, noisy_update=noisy_update)
+        aggregated_importance = self.server.aggregate_importance(client_updates) if need_importance_upload else None
+        # [MOD][阶段1] client update 已经在本地裁剪并加噪，server.aggregate 只做 weighted sum。
+        aggregated = self.server.aggregate(client_updates=client_updates)
         train_metrics = self.server.update_global_model(
             global_update=aggregated.noisy_update,
             stats_aggregated=aggregated.stats_aggregated,
@@ -194,6 +227,9 @@ class FLTrainer:
                 "signal_l2_norm": float(aggregated.signal_l2_norm),
                 "expected_noise_l2_norm": expected_noise_l2_norm,
                 "snr_signal_to_noise": float(snr_signal_to_noise),
+                "importance_upload": 1.0 if need_importance_upload else 0.0,
+                "local_importance_refresh": 1.0 if force_refresh_local_importance else 0.0,
+                "avg_local_noise_std": float(np.mean(local_noise_stds)) if local_noise_stds else 0.0,
             }
         )
 
@@ -210,6 +246,10 @@ class FLTrainer:
         global_weights,
         clip_norm: float,
         clip_weight_template,
+        global_importance_template,
+        local_noise_stds: Sequence[float],
+        need_importance_upload: bool,
+        force_refresh_local_importance: bool,
         round_num: int,
     ):
         client_updates = []
@@ -220,12 +260,17 @@ class FLTrainer:
                     self.clients[client_id].train_and_upload,
                     global_weights=copy_to_cpu(global_weights),
                     clip_norm=clip_norm,
+                    local_noise_std=float(local_noise_stds[idx]),
                     clip_weight_template=copy_to_cpu(clip_weight_template),
+                    global_importance_template=copy_to_cpu(global_importance_template),
+                    need_importance_upload=need_importance_upload,
+                    force_refresh_local_importance=force_refresh_local_importance,
+                    round_num=round_num,
                     return_importance_snapshot=self._need_viz(round_num, client_id),
                     importance_max_elements=int(self.cfg.importance_viz.max_elements),
                     generator=self._make_generator(round_num=round_num, client_id=client_id),
                 )
-                for client_id in selected_ids
+                for idx, client_id in enumerate(selected_ids)
             ]
 
             for future in as_completed(futures):
@@ -277,7 +322,8 @@ class FLTrainer:
                     f"clip_snr_proxy={train_metrics.get('clip_snr_proxy', 0.0):.4f} | "
                     f"signal={train_metrics.get('signal_l2_norm', 0.0):.4f} | "
                     f"expected_noise={train_metrics.get('expected_noise_l2_norm', 0.0):.4f} | "
-                    f"SNR={train_metrics.get('snr_signal_to_noise', 0.0):.4f}"
+                    f"SNR={train_metrics.get('snr_signal_to_noise', 0.0):.4f} | "
+                    f"ImpFrozen={train_metrics.get('importance_frozen', 0.0):.0f}"
                 )
                 if self.privacy_engine.is_enabled():
                     msg += f" | eps={train_metrics.get('epsilon_spent', 0.0):.4f}"
@@ -313,6 +359,9 @@ class FLTrainer:
             "round": round_num,
             "model_state_dict": self.server.global_model.state_dict(),
             "clip_norm": self.server.clip_norm,
+            "global_importance_template": self.server.global_importance_template,
+            "clip_weight_template": self.server.clip_weight_template,
+            "importance_frozen": self.server.importance_frozen,
             "config": OmegaConf.to_container(self.cfg, resolve=True),
         }
 
@@ -347,6 +396,8 @@ class FLTrainer:
             "total_rounds": len(history_data["rounds"]),
             "final_epsilon": history_data["privacy_spent"][-1] if history_data["privacy_spent"] else 0.0,
             "final_clip_norm": history_data["clip_history"][-1] if history_data["clip_history"] else 0.0,
+            "importance_frozen": self.server.importance_frozen,
+            "importance_distance": self.server.last_importance_distance,
         }
 
         full_record = {
@@ -384,22 +435,28 @@ def load_config(argv: List[str]) -> DictConfig:
         cfg.compressor.type = "identity"
         cfg.compressor.use_residual = False
         cfg.compressor.topk_ratio = 1.0
+        cfg.dp.use_global_importance_for_topk = False
+        cfg.dp.enable_importance_freeze = False
+        cfg.dp.global_local_mix_lambda = 0.0
     if experiment_name == "fedavg":
         cfg.dp.enabled = False
         cfg.dp.use_heterogeneous_noise = False
         cfg.client.training_strategy = "standard"
+        cfg.server.initial_clip = 1_000.0
+        cfg.server.clip_update_method = "ema"
+        cfg.server.ema_alpha = 1.0
     elif experiment_name == "dp_fedavg":
         cfg.dp.enabled = True
         cfg.dp.use_heterogeneous_noise = False
         cfg.client.training_strategy = "standard"
         cfg.server.clip_update_method = "ema"
-        cfg.server.ema_alpha = 0.8
+        cfg.server.ema_alpha = 1.0
     elif experiment_name == "dp_fedsam":
         cfg.dp.enabled = True
         cfg.dp.use_heterogeneous_noise = False
         cfg.client.training_strategy = "dp_fedsam"
         cfg.server.clip_update_method = "ema"
-        cfg.server.ema_alpha = 0.8
+        cfg.server.ema_alpha = 1.0
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     cfg.trainer.save_dir = f"./checkpoints/{experiment_name}_{timestamp}"
     cfg.trainer.log_dir = f"./logs/{experiment_name}_{timestamp}"

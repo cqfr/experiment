@@ -21,6 +21,8 @@ def get_dataloader(
     data_dir: str | None = None,
     min_samples_per_client: int = 1,
     split_max_attempts: int = 50,
+    num_workers: int = 0,
+    persistent_workers: bool = False,
 ) -> Tuple[List[DataLoader], DataLoader]:
     """Load dataset and split train data into client dataloaders."""
 
@@ -50,16 +52,27 @@ def get_dataloader(
             max_attempts=split_max_attempts,
         )
 
+    effective_persistent_workers = bool(persistent_workers and num_workers > 0)
     train_loaders = [
         DataLoader(
             Subset(train_dataset, indices),
             batch_size=batch_size,
             shuffle=True,
-            pin_memory=False,
+            # [MOD][阶段1] 固定 pin_memory，加速 CUDA 场景下的 non_blocking H2D 拷贝。
+            pin_memory=True,
+            num_workers=num_workers,
+            persistent_workers=effective_persistent_workers,
         )
         for indices in client_indices
     ]
-    test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False, pin_memory=False)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=256,
+        shuffle=False,
+        pin_memory=True,
+        num_workers=num_workers,
+        persistent_workers=effective_persistent_workers,
+    )
     return train_loaders, test_loader
 
 

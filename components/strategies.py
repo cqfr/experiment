@@ -87,6 +87,10 @@ class Compressor(Protocol):
         device: torch.device,
         return_importance_snapshot: bool = False,
         importance_max_elements: int = 4096,
+        global_importance_template: Optional[TensorDict] = None,
+        global_local_mix_lambda: float = 0.0,
+        reuse_cached_local_importance: bool = False,
+        force_refresh_local_importance: bool = False,
     ) -> CompressionResult:
         ...
 
@@ -344,8 +348,22 @@ class IdentityCompressor:
         device: torch.device,
         return_importance_snapshot: bool = False,
         importance_max_elements: int = 4096,
+        global_importance_template: Optional[TensorDict] = None,
+        global_local_mix_lambda: float = 0.0,
+        reuse_cached_local_importance: bool = False,
+        force_refresh_local_importance: bool = False,
     ) -> CompressionResult:
-        del model, dataloader, device, return_importance_snapshot, importance_max_elements
+        del (
+            model,
+            dataloader,
+            device,
+            return_importance_snapshot,
+            importance_max_elements,
+            global_importance_template,
+            global_local_mix_lambda,
+            reuse_cached_local_importance,
+            force_refresh_local_importance,
+        )
         return CompressionResult(delta_w=delta_w, upload_ratio=1.0)
 
 
@@ -354,6 +372,7 @@ class TopKCompressor:
         self.cfg = cfg
         self.residual_accumulator = ResidualAccumulator()
         self.fisher_cache: Optional[TensorDict] = None
+        self.cached_local_importance: Optional[TensorDict] = None
 
     def move_state_to(self, device: torch.device) -> None:
         if self.residual_accumulator.residual:
@@ -362,6 +381,10 @@ class TopKCompressor:
             }
         if self.fisher_cache is not None:
             self.fisher_cache = {name: tensor.to(device) for name, tensor in self.fisher_cache.items()}
+        if self.cached_local_importance is not None:
+            self.cached_local_importance = {
+                name: tensor.to(device) for name, tensor in self.cached_local_importance.items()
+            }
 
     def move_state_to_cpu(self) -> None:
         if self.residual_accumulator.residual:
@@ -370,6 +393,10 @@ class TopKCompressor:
             }
         if self.fisher_cache is not None:
             self.fisher_cache = {name: tensor.detach().cpu() for name, tensor in self.fisher_cache.items()}
+        if self.cached_local_importance is not None:
+            self.cached_local_importance = {
+                name: tensor.detach().cpu() for name, tensor in self.cached_local_importance.items()
+            }
 
     def compress(
         self,
@@ -379,12 +406,28 @@ class TopKCompressor:
         device: torch.device,
         return_importance_snapshot: bool = False,
         importance_max_elements: int = 4096,
+        global_importance_template: Optional[TensorDict] = None,
+        global_local_mix_lambda: float = 0.0,
+        reuse_cached_local_importance: bool = False,
+        force_refresh_local_importance: bool = False,
     ) -> CompressionResult:
         working_delta = delta_w
         if bool(self.cfg.use_residual):
             working_delta = self.residual_accumulator.accumulate(delta_w)
 
-        importance = self._compute_importance(working_delta, model, dataloader, device)
+        local_importance = self._resolve_local_importance(
+            delta_w=working_delta,
+            model=model,
+            dataloader=dataloader,
+            device=device,
+            reuse_cached_local_importance=reuse_cached_local_importance,
+            force_refresh_local_importance=force_refresh_local_importance,
+        )
+        mixed_importance = self._mix_importance(
+            local_importance=local_importance,
+            global_importance_template=global_importance_template,
+            mix_lambda=float(global_local_mix_lambda),
+        )
         sparse_delta, masks = compress_gradient(
             gradient=working_delta,
             importance_strategy=str(self.cfg.importance_strategy),
@@ -392,7 +435,7 @@ class TopKCompressor:
             k_ratio=float(self.cfg.topk_ratio),
             weight_method=str(self.cfg.layer_weight_method),
             fisher=self.fisher_cache,
-            importance=importance,
+            importance=mixed_importance,
         )
 
         if bool(self.cfg.use_residual):
@@ -405,17 +448,34 @@ class TopKCompressor:
         importance_vector = None
         mask_vector = None
         if return_importance_snapshot:
-            importance_vector = build_vector_snapshot(importance, max_elements=importance_max_elements)
+            importance_vector = build_vector_snapshot(mixed_importance, max_elements=importance_max_elements)
             mask_vector = build_vector_snapshot(masks, max_elements=importance_max_elements)
 
         return CompressionResult(
             delta_w=sparse_delta,
             upload_ratio=upload_ratio,
-            importance_dict=importance,
+            # [MOD][阶段2] 上传给 server 的是 local importance，server 端再统一做归一化与聚合。
+            importance_dict=clone_tensor_dict(local_importance),
             mask_dict=masks,
             importance_vector=importance_vector,
             mask_vector=mask_vector,
         )
+
+    def _resolve_local_importance(
+        self,
+        delta_w: TensorDict,
+        model: nn.Module,
+        dataloader: DataLoader,
+        device: torch.device,
+        reuse_cached_local_importance: bool,
+        force_refresh_local_importance: bool,
+    ) -> TensorDict:
+        if reuse_cached_local_importance and not force_refresh_local_importance and self.cached_local_importance is not None:
+            return {name: tensor.to(device) for name, tensor in self.cached_local_importance.items()}
+
+        local_importance = self._compute_importance(delta_w, model, dataloader, device)
+        self.cached_local_importance = {name: tensor.detach().cpu() for name, tensor in local_importance.items()}
+        return local_importance
 
     def _compute_importance(
         self,
@@ -435,6 +495,34 @@ class TopKCompressor:
         if strategy == "grad_squared":
             return {name: tensor.abs().pow(2) for name, tensor in delta_w.items()}
         return compute_importance_grad_normalized(delta_w)
+
+    def _mix_importance(
+        self,
+        local_importance: TensorDict,
+        global_importance_template: Optional[TensorDict],
+        mix_lambda: float,
+    ) -> TensorDict:
+        if global_importance_template is None or mix_lambda <= 0:
+            return normalize_importance_dict(local_importance)
+
+        local_normalized = normalize_importance_dict(local_importance)
+        global_normalized = normalize_importance_dict(
+            {
+                name: tensor.to(local_normalized[name].device)
+                for name, tensor in global_importance_template.items()
+                if name in local_normalized
+            }
+        )
+
+        blended: TensorDict = {}
+        for name, local_tensor in local_normalized.items():
+            global_tensor = global_normalized.get(name)
+            if global_tensor is None:
+                blended[name] = local_tensor
+                continue
+            # [MOD][阶段2] 用加法混合统一压缩几何：global prior + local correction。
+            blended[name] = mix_lambda * global_tensor + (1.0 - mix_lambda) * local_tensor
+        return blended
 
 
 class StandardL2Clipper:
@@ -470,17 +558,7 @@ class WeightedL2Clipper:
                 raise KeyError(f"Missing clip weight template for parameter: {name}")
 
             weights = clip_weights[name].to(tensor.device).clamp_min(1e-6)
-            # 数学解释：
-            # 1. 当不同参数维度在服务端将被施加不同标准差的高斯噪声时，
-            #    直接使用普通 L2 裁剪 ||g||_2 会把所有坐标当成同一个几何尺度，
-            #    这与异构噪声的真实敏感度几何不匹配。
-            # 2. 这里改用 ||g||_{W^{-1}} = sqrt(sum_i (g_i / w_i)^2)。
-            #    先除以 w_i，等价于把第 i 个坐标映射到“按噪声尺度标准化后的坐标系”。
-            #    w_i 越大，表示该坐标允许更大的有效振幅；w_i 越小，表示该坐标更敏感。
-            # 3. 因而裁剪集合不再是球，而是与噪声协方差对齐的椭球。
-            #    这样在进行对角异构噪声注入时，敏感度上界与噪声模板是匹配的。
-            # 4. baseline 的 FedAvg / DP-FedAvg / DP-FedSAM 默认使用同方差噪声，
-            #    协方差与单位阵成比例，不需要这套椭球裁剪，退化成标准 L2 即可。
+            # [MOD][阶段2] 继续使用 ||g||_{W^-1}，让 weighted clipping 和异构噪声几何保持一致。
             norm_terms.append(((tensor / weights) ** 2).sum())
 
         weighted_norm = float(torch.sqrt(torch.stack(norm_terms).sum()).item()) if norm_terms else 0.0
@@ -560,6 +638,16 @@ class PrivacyEngine:
     def remaining_budget(self) -> float:
         return self.accountant.remaining_budget() if self.accountant is not None else 0.0
 
+    @staticmethod
+    def compute_local_noise_std(
+        clip_norm: float,
+        noise_multiplier: float,
+        num_selected_clients: int,
+    ) -> float:
+        if clip_norm <= 0 or noise_multiplier <= 0 or num_selected_clients <= 0:
+            return 0.0
+        return (float(clip_norm) * float(noise_multiplier)) / math.sqrt(float(num_selected_clients))
+
     def add_server_noise(
         self,
         global_update: TensorDict,
@@ -568,6 +656,7 @@ class PrivacyEngine:
         clip_weight_template: Optional[TensorDict],
         generator: Optional[torch.Generator] = None,
     ) -> TensorDict:
+        # [MOD][阶段1] 该函数保留为 legacy 辅助逻辑，主训练流程不再依赖 server-side noise。
         if sigma_agg <= 0:
             return clone_tensor_dict(global_update)
 
@@ -634,6 +723,15 @@ def build_compressor(compressor_cfg) -> Compressor:
 
 def build_clipper(use_weighted: bool) -> AdaptiveClipper:
     return WeightedL2Clipper() if use_weighted else StandardL2Clipper()
+
+
+def normalize_importance_dict(tensors: TensorDict, eps: float = 1e-6) -> TensorDict:
+    normalized: TensorDict = {}
+    for name, tensor in tensors.items():
+        sanitized = torch.nan_to_num(tensor.detach().float().abs(), nan=0.0, posinf=0.0, neginf=0.0)
+        mean_value = sanitized.mean().clamp_min(eps)
+        normalized[name] = sanitized / mean_value
+    return normalized
 
 
 def build_vector_snapshot(tensors: TensorDict, max_elements: int = 4096) -> torch.Tensor:
