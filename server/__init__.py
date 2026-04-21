@@ -1,7 +1,3 @@
-"""
-服务器模块
-"""
+from .server import AggregatedResult, FLServer
 
-from .server import FLServer
-
-__all__ = ["FLServer"]
+__all__ = ["AggregatedResult", "FLServer"]

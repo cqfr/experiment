@@ -1,0 +1,78 @@
+experiment:
+  name: proposed
+
+seed: 42
+
+model:
+  name: simple_cnn
+  num_classes: 10
+
+data:
+  dataset: cifar10
+  num_clients: 500
+  clients_per_round: 50
+  batch_size: 32
+  iid: false
+  alpha: 0.5
+  min_samples_per_client: 20
+  split_max_attempts: 100
+  data_dir: null
+
+trainer:
+  num_rounds: 100
+  max_workers: 8
+  device: auto
+  log_interval: 1
+  save_interval: 10
+  save_dir: ./checkpoints
+  log_dir: ./logs
+
+client:
+  training_strategy: contrastive
+  local_epochs: 5
+  lr: 0.01
+  momentum: 0.9
+  weight_decay: 0.0001
+  alpha: 0.005
+  beta: 0.005
+  contrastive_margin: 1.0
+  mu: 0.01
+  sam_rho: 0.05
+  sam_eps: 1.0e-12
+  stat_type: l2_norm
+
+compressor:
+  type: topk
+  importance_strategy: grad_normalized
+  topk_strategy: weighted_layer_norm
+  topk_ratio: 0.1
+  layer_weight_method: mean
+  use_residual: true
+
+server:
+  server_lr: 1.0
+  aggregation_weight_strategy: data_size
+  initial_clip: 1.0
+  clip_update_method: adaptive
+  target_quantile: 0.9
+  clip_lr: 0.2
+  ema_alpha: 0.8
+
+dp:
+  enabled: true
+  epsilon_total: 8.0
+  delta: 1.0e-5
+  use_heterogeneous_noise: true
+  min_relative_noise: 0.3
+  max_relative_noise: 3.0
+  template_ema: 0.9
+  account_for_topk_in_q: false
+  rdp_orders: [2, 3, 4, 5, 8, 16, 32, 64, 128, 256]
+  rdp_steps_per_round: 1
+  trusted_server_for_stats: true
+
+importance_viz:
+  enabled: false
+  interval: 10
+  client_id: 0
+  max_elements: 4096
