@@ -15,6 +15,7 @@ DatasetName = Literal["cifar10", "mnist"]
 def get_dataloader(
     num_clients: int = 500,
     batch_size: int = 32,
+    eval_batch_size: int = 256,
     alpha: float = 0.5,
     iid: bool = False,
     dataset: DatasetName = "cifar10",
@@ -23,6 +24,8 @@ def get_dataloader(
     split_max_attempts: int = 50,
     num_workers: int = 0,
     persistent_workers: bool = False,
+    pin_memory: bool = False,
+    prefetch_factor: int | None = None,
 ) -> Tuple[List[DataLoader], DataLoader]:
     """Load dataset and split train data into client dataloaders."""
 
@@ -53,25 +56,27 @@ def get_dataloader(
         )
 
     effective_persistent_workers = bool(persistent_workers and num_workers > 0)
+    loader_kwargs = {
+        "pin_memory": bool(pin_memory),
+        "num_workers": num_workers,
+        "persistent_workers": effective_persistent_workers,
+    }
+    if num_workers > 0 and prefetch_factor is not None:
+        loader_kwargs["prefetch_factor"] = int(prefetch_factor)
     train_loaders = [
         DataLoader(
             Subset(train_dataset, indices),
             batch_size=batch_size,
             shuffle=True,
-            # [MOD][阶段1] 固定 pin_memory，加速 CUDA 场景下的 non_blocking H2D 拷贝。
-            pin_memory=True,
-            num_workers=num_workers,
-            persistent_workers=effective_persistent_workers,
+            **loader_kwargs,
         )
         for indices in client_indices
     ]
     test_loader = DataLoader(
         test_dataset,
-        batch_size=256,
+        batch_size=eval_batch_size,
         shuffle=False,
-        pin_memory=True,
-        num_workers=num_workers,
-        persistent_workers=effective_persistent_workers,
+        **loader_kwargs,
     )
     return train_loaders, test_loader
 

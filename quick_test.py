@@ -37,7 +37,7 @@ def test_dp_accountant() -> None:
 
 
 def test_client_server_round() -> None:
-    from client.client import FLClient
+    from client.client import FLClient, FLClientWorker
     from server.server import FLServer
 
     class TinyNet(nn.Module):
@@ -111,14 +111,15 @@ def test_client_server_round() -> None:
 
     client = FLClient(
         client_id=0,
-        model=model,
         dataloader=loader,
         cfg=cfg,
         device=torch.device("cpu"),
     )
+    worker = FLClientWorker(model=model, cfg=cfg, device=torch.device("cpu"))
 
     global_weights = model.state_dict()
-    update = client.train_and_upload(
+    update = worker.train_and_upload(
+        client=client,
         global_weights=global_weights,
         clip_norm=1.0,
         local_noise_std=0.1,

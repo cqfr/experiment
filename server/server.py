@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from components.strategies import normalize_importance_dict
+from components.strategies import normalize_importance_dict, resolve_amp_dtype, resolve_amp_enabled
 
 TensorDict = Dict[str, torch.Tensor]
 
@@ -25,6 +25,13 @@ class AggregatedResult:
     total_params: int
 
 
+@dataclass
+class BroadcastPayload:
+    global_weights: TensorDict
+    clip_weight_template: Optional[TensorDict]
+    global_importance_template: Optional[TensorDict]
+
+
 class FLServer:
     """Server for aggregation, clip-template maintenance, and evaluation."""
 
@@ -32,6 +39,11 @@ class FLServer:
         self.cfg = cfg
         self.device = device
         self.global_model = copy.deepcopy(model).to(device)
+        self.channels_last = bool(getattr(cfg.trainer, "channels_last", False) and device.type == "cuda")
+        self.use_amp = resolve_amp_enabled(cfg.trainer, device)
+        self.amp_dtype = resolve_amp_dtype(getattr(cfg.trainer, "amp_dtype", "float16"), device)
+        if self.channels_last:
+            self.global_model = self.global_model.to(memory_format=torch.channels_last)
 
         self.clip_norm = float(cfg.server.initial_clip)
         self.clip_history: List[float] = []
@@ -59,6 +71,31 @@ class FLServer:
 
     def get_global_weights(self) -> TensorDict:
         return copy.deepcopy(self.global_model.state_dict())
+
+    def build_broadcast_payload(
+        self,
+        include_clip_weight_template: bool,
+        include_global_importance_template: bool,
+    ) -> BroadcastPayload:
+        global_weights = {
+            name: tensor.detach().cpu().clone()
+            for name, tensor in self.global_model.state_dict().items()
+        }
+        clip_weight_template = (
+            {name: tensor.detach().cpu().clone() for name, tensor in self.clip_weight_template.items()}
+            if include_clip_weight_template
+            else None
+        )
+        global_importance_template = (
+            {name: tensor.detach().cpu().clone() for name, tensor in self.global_importance_template.items()}
+            if include_global_importance_template
+            else None
+        )
+        return BroadcastPayload(
+            global_weights=global_weights,
+            clip_weight_template=clip_weight_template,
+            global_importance_template=global_importance_template,
+        )
 
     def get_clip_norm(self) -> float:
         return self.clip_norm
@@ -143,12 +180,19 @@ class FLServer:
         correct = 0
         total = 0
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for data, target in test_loader:
                 data = data.to(self.device, non_blocking=True)
+                if self.channels_last and data.ndim == 4:
+                    data = data.contiguous(memory_format=torch.channels_last)
                 target = target.to(self.device, non_blocking=True)
-                logits = self.global_model(data)
-                loss = criterion(logits, target)
+                if self.use_amp and self.amp_dtype is not None and self.device.type == "cuda":
+                    with torch.autocast(device_type="cuda", dtype=self.amp_dtype):
+                        logits = self.global_model(data)
+                        loss = criterion(logits, target)
+                else:
+                    logits = self.global_model(data)
+                    loss = criterion(logits, target)
                 total_loss += float(loss.item()) * data.size(0)
                 pred = logits.argmax(dim=1)
                 correct += int((pred == target).sum().item())

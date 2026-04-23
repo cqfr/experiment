@@ -23,10 +23,18 @@ trainer:
   max_workers: 8
   num_workers: 0
   persistent_workers: false
+  prefetch_factor: 2
+  pin_memory: auto
   device: auto
   keep_client_model_on_device: true
   min_cuda_free_ratio: 0.15
   cuda_empty_cache_each_round: false
+  cudnn_benchmark: true
+  allow_tf32: true
+  amp_enabled: auto
+  amp_dtype: float16
+  channels_last: true
+  eval_batch_size: 512
   log_interval: 1
   save_interval: 10
   save_dir: ./checkpoints

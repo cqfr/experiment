@@ -3,6 +3,7 @@ from __future__ import annotations
 """Training, compression, clipping, and privacy strategies."""
 
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Dict, Optional, Protocol, Sequence
 
@@ -62,6 +63,10 @@ class LocalTrainer(Protocol):
         global_weights: Optional[TensorDict] = None,
         old_local_weights: Optional[TensorDict] = None,
         generator: Optional[torch.Generator] = None,
+        amp_enabled: bool = False,
+        amp_dtype: Optional[torch.dtype] = None,
+        grad_scaler=None,
+        channels_last: bool = False,
     ) -> TensorDict:
         ...
 
@@ -139,6 +144,43 @@ class _BaseTrainer:
     def needs_global_weights(self) -> bool:
         return False
 
+    @staticmethod
+    def _move_batch(
+        data: torch.Tensor,
+        target: torch.Tensor,
+        device: torch.device,
+        channels_last: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        data = data.to(device, non_blocking=True)
+        if channels_last and data.ndim == 4:
+            data = data.contiguous(memory_format=torch.channels_last)
+        target = target.to(device, non_blocking=True)
+        return data, target
+
+    @staticmethod
+    def _autocast(
+        device: torch.device,
+        amp_enabled: bool,
+        amp_dtype: Optional[torch.dtype],
+    ):
+        if not amp_enabled or amp_dtype is None or device.type not in {"cuda", "cpu"}:
+            return nullcontext()
+        return torch.autocast(device_type=device.type, dtype=amp_dtype)
+
+    @staticmethod
+    def _backward_step(
+        loss: torch.Tensor,
+        optimizer: optim.Optimizer,
+        grad_scaler,
+    ) -> None:
+        if grad_scaler is not None and grad_scaler.is_enabled():
+            grad_scaler.scale(loss).backward()
+            grad_scaler.step(optimizer)
+            grad_scaler.update()
+            return
+        loss.backward()
+        optimizer.step()
+
 
 class StandardTrainer(_BaseTrainer):
     def train(
@@ -149,6 +191,10 @@ class StandardTrainer(_BaseTrainer):
         global_weights: Optional[TensorDict] = None,
         old_local_weights: Optional[TensorDict] = None,
         generator: Optional[torch.Generator] = None,
+        amp_enabled: bool = False,
+        amp_dtype: Optional[torch.dtype] = None,
+        grad_scaler=None,
+        channels_last: bool = False,
     ) -> TensorDict:
         del global_weights, old_local_weights, generator
         model.train()
@@ -158,12 +204,11 @@ class StandardTrainer(_BaseTrainer):
 
         for _ in range(int(self.cfg.local_epochs)):
             for data, target in dataloader:
-                data = data.to(device, non_blocking=True)
-                target = target.to(device, non_blocking=True)
+                data, target = self._move_batch(data, target, device, channels_last)
                 optimizer.zero_grad(set_to_none=True)
-                loss = criterion(model(data), target)
-                loss.backward()
-                optimizer.step()
+                with self._autocast(device, amp_enabled, amp_dtype):
+                    loss = criterion(model(data), target)
+                self._backward_step(loss, optimizer, grad_scaler)
 
         return self._delta_from_init(model, init_weights)
 
@@ -183,6 +228,10 @@ class ContrastiveTrainer(_BaseTrainer):
         global_weights: Optional[TensorDict] = None,
         old_local_weights: Optional[TensorDict] = None,
         generator: Optional[torch.Generator] = None,
+        amp_enabled: bool = False,
+        amp_dtype: Optional[torch.dtype] = None,
+        grad_scaler=None,
+        channels_last: bool = False,
     ) -> TensorDict:
         del generator
         model.train()
@@ -192,14 +241,13 @@ class ContrastiveTrainer(_BaseTrainer):
 
         for _ in range(int(self.cfg.local_epochs)):
             for data, target in dataloader:
-                data = data.to(device, non_blocking=True)
-                target = target.to(device, non_blocking=True)
+                data, target = self._move_batch(data, target, device, channels_last)
                 optimizer.zero_grad(set_to_none=True)
-                logits = model(data)
-                loss = criterion(logits, target)
-                loss = loss + self._contrastive_regularization(model, global_weights, old_local_weights, device)
-                loss.backward()
-                optimizer.step()
+                with self._autocast(device, amp_enabled, amp_dtype):
+                    logits = model(data)
+                    loss = criterion(logits, target)
+                    loss = loss + self._contrastive_regularization(model, global_weights, old_local_weights, device)
+                self._backward_step(loss, optimizer, grad_scaler)
 
         return self._delta_from_init(model, init_weights)
 
@@ -238,6 +286,10 @@ class FedProxTrainer(_BaseTrainer):
         global_weights: Optional[TensorDict] = None,
         old_local_weights: Optional[TensorDict] = None,
         generator: Optional[torch.Generator] = None,
+        amp_enabled: bool = False,
+        amp_dtype: Optional[torch.dtype] = None,
+        grad_scaler=None,
+        channels_last: bool = False,
     ) -> TensorDict:
         del old_local_weights, generator
         model.train()
@@ -247,14 +299,13 @@ class FedProxTrainer(_BaseTrainer):
 
         for _ in range(int(self.cfg.local_epochs)):
             for data, target in dataloader:
-                data = data.to(device, non_blocking=True)
-                target = target.to(device, non_blocking=True)
+                data, target = self._move_batch(data, target, device, channels_last)
                 optimizer.zero_grad(set_to_none=True)
-                logits = model(data)
-                loss = criterion(logits, target)
-                loss = loss + self._proximal_penalty(model, global_weights, device)
-                loss.backward()
-                optimizer.step()
+                with self._autocast(device, amp_enabled, amp_dtype):
+                    logits = model(data)
+                    loss = criterion(logits, target)
+                    loss = loss + self._proximal_penalty(model, global_weights, device)
+                self._backward_step(loss, optimizer, grad_scaler)
 
         return self._delta_from_init(model, init_weights)
 
@@ -283,6 +334,10 @@ class DPFedSAMTrainer(_BaseTrainer):
         global_weights: Optional[TensorDict] = None,
         old_local_weights: Optional[TensorDict] = None,
         generator: Optional[torch.Generator] = None,
+        amp_enabled: bool = False,
+        amp_dtype: Optional[torch.dtype] = None,
+        grad_scaler=None,
+        channels_last: bool = False,
     ) -> TensorDict:
         del global_weights, old_local_weights, generator
         model.train()
@@ -292,12 +347,16 @@ class DPFedSAMTrainer(_BaseTrainer):
 
         for _ in range(int(self.cfg.local_epochs)):
             for data, target in dataloader:
-                data = data.to(device, non_blocking=True)
-                target = target.to(device, non_blocking=True)
+                data, target = self._move_batch(data, target, device, channels_last)
 
                 optimizer.zero_grad(set_to_none=True)
-                loss = criterion(model(data), target)
-                loss.backward()
+                with self._autocast(device, amp_enabled, amp_dtype):
+                    loss = criterion(model(data), target)
+                if grad_scaler is not None and grad_scaler.is_enabled():
+                    grad_scaler.scale(loss).backward()
+                    grad_scaler.unscale_(optimizer)
+                else:
+                    loss.backward()
 
                 grad_norm = self._grad_l2_norm(model, device)
                 scale = float(self.cfg.sam_rho) / (grad_norm + float(self.cfg.sam_eps))
@@ -313,15 +372,23 @@ class DPFedSAMTrainer(_BaseTrainer):
                         perturbations.append(e_w)
 
                 optimizer.zero_grad(set_to_none=True)
-                perturbed_loss = criterion(model(data), target)
-                perturbed_loss.backward()
+                with self._autocast(device, amp_enabled, amp_dtype):
+                    perturbed_loss = criterion(model(data), target)
+                if grad_scaler is not None and grad_scaler.is_enabled():
+                    grad_scaler.scale(perturbed_loss).backward()
+                else:
+                    perturbed_loss.backward()
 
                 with torch.no_grad():
                     for param, e_w in zip(model.parameters(), perturbations):
                         if e_w is not None:
                             param.sub_(e_w)
 
-                optimizer.step()
+                if grad_scaler is not None and grad_scaler.is_enabled():
+                    grad_scaler.step(optimizer)
+                    grad_scaler.update()
+                else:
+                    optimizer.step()
 
         return self._delta_from_init(model, init_weights)
 
@@ -723,6 +790,29 @@ def build_compressor(compressor_cfg) -> Compressor:
 
 def build_clipper(use_weighted: bool) -> AdaptiveClipper:
     return WeightedL2Clipper() if use_weighted else StandardL2Clipper()
+
+
+def resolve_amp_enabled(trainer_cfg, device: torch.device) -> bool:
+    raw_value = getattr(trainer_cfg, "amp_enabled", "auto")
+    if isinstance(raw_value, bool):
+        return bool(raw_value and device.type == "cuda")
+
+    normalized = str(raw_value).strip().lower()
+    if normalized == "auto":
+        return device.type == "cuda"
+    if normalized in {"1", "true", "yes", "on"}:
+        return device.type == "cuda"
+    return False
+
+
+def resolve_amp_dtype(raw_value, device: torch.device) -> Optional[torch.dtype]:
+    if device.type != "cuda":
+        return None
+
+    normalized = str(raw_value).strip().lower()
+    if normalized == "bfloat16":
+        return torch.bfloat16
+    return torch.float16
 
 
 def normalize_importance_dict(tensors: TensorDict, eps: float = 1e-6) -> TensorDict:
