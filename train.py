@@ -36,8 +36,10 @@ class ExperimentState:
     clip_history: List[float] = field(default_factory=list)
     privacy_spent: List[float] = field(default_factory=list)
     upload_ratio: List[float] = field(default_factory=list)
+    q_accounting: List[float] = field(default_factory=list)
     noise_multiplier: List[float] = field(default_factory=list)
     sigma_agg: List[float] = field(default_factory=list)
+    compression_sensitivity_scale: List[float] = field(default_factory=list)
     clip_snr_proxy: List[float] = field(default_factory=list)
     signal_l2_norm: List[float] = field(default_factory=list)
     expected_noise_l2_norm: List[float] = field(default_factory=list)
@@ -126,6 +128,7 @@ class FLTrainer:
         if isinstance(raw_value, bool):
             return bool(raw_value)
         normalized = str(raw_value).strip().lower()
+        #上面这些的作用是接收字符串
         if normalized == "auto":
             return self.device.type == "cuda"
         return normalized in {"1", "true", "yes", "on"}
@@ -314,9 +317,11 @@ class FLTrainer:
         train_metrics.update(
             {
                 "avg_upload_ratio": avg_upload_ratio,
+                "q_accounting": float(privacy_state.q_accounting),
                 "noise_multiplier": float(privacy_state.noise_multiplier),
                 "sigma_agg": float(privacy_state.sigma_agg),
                 "sensitivity_l2": float(privacy_state.sensitivity_l2),
+                "compression_sensitivity_scale": float(privacy_state.compression_sensitivity_scale),
                 "clip_snr_proxy": float(privacy_state.clip_snr_proxy),
                 "signal_l2_norm": float(aggregated.signal_l2_norm),
                 "expected_noise_l2_norm": expected_noise_l2_norm,
@@ -421,8 +426,12 @@ class FLTrainer:
                 self.history.test_metrics.append(test_metrics)
                 self.history.clip_history.append(train_metrics.get("new_clip", 0.0))
                 self.history.upload_ratio.append(train_metrics.get("avg_upload_ratio", 1.0))
+                self.history.q_accounting.append(train_metrics.get("q_accounting", 0.0))
                 self.history.noise_multiplier.append(train_metrics.get("noise_multiplier", 0.0))
                 self.history.sigma_agg.append(train_metrics.get("sigma_agg", 0.0))
+                self.history.compression_sensitivity_scale.append(
+                    train_metrics.get("compression_sensitivity_scale", 1.0)
+                )
                 self.history.clip_snr_proxy.append(train_metrics.get("clip_snr_proxy", 0.0))
                 self.history.signal_l2_norm.append(train_metrics.get("signal_l2_norm", 0.0))
                 self.history.expected_noise_l2_norm.append(train_metrics.get("expected_noise_l2_norm", 0.0))
@@ -511,8 +520,10 @@ class FLTrainer:
             "clip_history": self.history.clip_history,
             "privacy_spent": self.history.privacy_spent,
             "upload_ratio": self.history.upload_ratio,
+            "q_accounting": self.history.q_accounting,
             "noise_multiplier": self.history.noise_multiplier,
             "sigma_agg": self.history.sigma_agg,
+            "compression_sensitivity_scale": self.history.compression_sensitivity_scale,
             "clip_snr_proxy": self.history.clip_snr_proxy,
             "signal_l2_norm": self.history.signal_l2_norm,
             "expected_noise_l2_norm": self.history.expected_noise_l2_norm,

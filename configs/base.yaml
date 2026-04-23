@@ -93,6 +93,8 @@ dp:
   client_noise_allocation: uniform
   client_variance_max_scale: 10.0
   account_for_topk_in_q: false
+  account_for_topk_in_sensitivity: true
+  topk_sensitivity_scaling: sqrt
   rdp_orders: [2, 3, 4, 5, 8, 16, 32, 64, 128, 256]
   rdp_steps_per_round: 1
   trusted_server_for_stats: true

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 """Federated server implementation."""
 
@@ -97,7 +97,7 @@ class FLServer:
             global_importance_template=global_importance_template,
         )
 
-    def get_clip_norm(self) -> float:
+    def get_clip_norm(self) -> float: #
         return self.clip_norm
 
     def get_clip_weight_template(self) -> TensorDict:

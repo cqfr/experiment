@@ -50,6 +50,7 @@ class PrivacyRoundState:
     noise_multiplier: float
     sigma_agg: float
     sensitivity_l2: float
+    compression_sensitivity_scale: float
     clip_snr_proxy: float
     q_accounting: float
 
@@ -666,19 +667,25 @@ class PrivacyEngine:
                 noise_multiplier=0.0,
                 sigma_agg=0.0,
                 sensitivity_l2=0.0,
+                compression_sensitivity_scale=1.0,
                 clip_snr_proxy=0.0,
                 q_accounting=0.0,
             )
 
         q_accounting = float(sampling_rate)
-        if bool(self.dp_cfg.account_for_topk_in_q):
-            q_accounting *= float(compressor_ratio)
+        # Top-k changes the update geometry, not the probability that a client is sampled.
+        # Therefore q remains the client participation rate; compression is accounted
+        # for through the L2 sensitivity scale below.
 
         noise_multiplier = self.accountant.solve_noise_multiplier_for_round(
             q=q_accounting,
             steps=int(self.dp_cfg.rdp_steps_per_round),
         )
-        sensitivity_l2 = compute_weighted_sensitivity(client_weights=client_weights, clip_norm=clip_norm)
+        compression_sensitivity_scale = self._compression_sensitivity_scale(compressor_ratio)
+        sensitivity_l2 = (
+            compute_weighted_sensitivity(client_weights=client_weights, clip_norm=clip_norm)
+            * compression_sensitivity_scale
+        )
         sigma_agg = float(noise_multiplier) * float(sensitivity_l2)
         clip_snr_proxy = float(clip_norm / max(sigma_agg, 1e-12)) if sigma_agg > 0 else 0.0
 
@@ -686,9 +693,28 @@ class PrivacyEngine:
             noise_multiplier=float(noise_multiplier),
             sigma_agg=float(sigma_agg),
             sensitivity_l2=float(sensitivity_l2),
+            compression_sensitivity_scale=float(compression_sensitivity_scale),
             clip_snr_proxy=float(clip_snr_proxy),
             q_accounting=float(q_accounting),
         )
+
+    def _compression_sensitivity_scale(self, compressor_ratio: float) -> float:
+        if not bool(getattr(self.dp_cfg, "account_for_topk_in_sensitivity", True)):
+            return 1.0
+
+        ratio = float(compressor_ratio)
+        if ratio <= 0:
+            raise ValueError("compressor_ratio must be > 0 when used for sensitivity accounting")
+        ratio = min(1.0, ratio)
+
+        mode = str(getattr(self.dp_cfg, "topk_sensitivity_scaling", "sqrt"))
+        if mode == "none":
+            return 1.0
+        if mode == "sqrt":
+            return math.sqrt(ratio)
+        if mode == "linear":
+            return ratio
+        raise ValueError(f"Unknown topk_sensitivity_scaling: {mode}")
 
     def consume_round(self, round_state: PrivacyRoundState) -> float:
         if self.accountant is None:

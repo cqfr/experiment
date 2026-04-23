@@ -184,6 +184,11 @@ class DPConfig:
     # Keep False by default to align q with client participation sampling.
     account_for_topk_in_q: bool = False
 
+    # Whether to account for Top-k compression through the clipped L2 sensitivity.
+    # q remains the client participation rate; compression affects sensitivity instead.
+    account_for_topk_in_sensitivity: bool = True
+    topk_sensitivity_scaling: Literal["none", "sqrt", "linear"] = "sqrt"
+
     # Explicit modeling assumption accepted by the user.
     trusted_server_for_stats: bool = True
 

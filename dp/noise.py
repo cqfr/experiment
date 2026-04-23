@@ -169,7 +169,7 @@ def allocate_client_noise_stds(
             raise ValueError("client_importance is required for heterogeneous strategy")
         if len(client_importance) != len(normalized_weights):
             raise ValueError("client_importance length mismatch")
-
+#计算调和比例
         raw_scales = [1.0 / max(float(importance), eps) for importance in client_importance]
         total_scale = sum(raw_scales)
         if total_scale <= 0:
