@@ -567,6 +567,9 @@ class FLTrainer:
             json.dump(history_data, handle, indent=2, ensure_ascii=False)
 
 def load_config(argv: List[str]) -> DictConfig:
+    explicit_save_dir = any(arg.startswith("trainer.save_dir=") for arg in argv)
+    explicit_log_dir = any(arg.startswith("trainer.log_dir=") for arg in argv)
+
     base_cfg = OmegaConf.load(Path("configs") / "base.yaml")
     cli_cfg = OmegaConf.from_dotlist(argv)
     cfg = OmegaConf.merge(base_cfg, cli_cfg)
@@ -599,8 +602,10 @@ def load_config(argv: List[str]) -> DictConfig:
         cfg.server.clip_update_method = "ema"
         cfg.server.ema_alpha = 1.0
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    cfg.trainer.save_dir = f"./checkpoints/{experiment_name}_{timestamp}"
-    cfg.trainer.log_dir = f"./logs/{experiment_name}_{timestamp}"
+    if not explicit_save_dir:
+        cfg.trainer.save_dir = f"./checkpoints/{experiment_name}_{timestamp}"
+    if not explicit_log_dir:
+        cfg.trainer.log_dir = f"./logs/{experiment_name}_{timestamp}"
     return cfg
 
 
